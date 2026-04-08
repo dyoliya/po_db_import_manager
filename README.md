@@ -1,4 +1,4 @@
-# PO DB Import Manager
+# Pooling Order DB Import Manager
 
 PO DB Import Manager is a desktop data consolidation tool for pooling-order mineral owner records. It imports data from separately maintained Google-Sheets exports, normalizes owner and address data, enriches records with BUDB / PROD / Pipedrive match IDs, and writes the final dataset into a local SQLite database for fast and consistent lookup.
 
