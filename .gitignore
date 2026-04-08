@@ -1,0 +1,48 @@
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.vscode
+
+# Environment variables file (contains secrets)
+.env
+config/
+
+# Virtual environments
+venv/
+env/
+tests/
+build/
+dist/
+debug_output/
+test_output/
+
+# data folders
+output/
+input/
+old/
+new/
+database/
+cache/
+budb/
+for_matching_serials/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+match-serials.py
+
+*.exe
+*.spec
+*.zip
+*.xlsx
+*.db
+*.xlsx
+*.csv
+old_ui.py
+*.json
+google_test_export.py
+*.mp4
