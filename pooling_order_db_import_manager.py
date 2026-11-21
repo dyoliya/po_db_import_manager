@@ -117,6 +117,191 @@ def get_existing_columns(conn: sqlite3.Connection, table_name: str) -> list[str]
     cur.execute(f"PRAGMA table_info({table_name})")
     return [row[1] for row in cur.fetchall()]
 
+def sqlite_quote_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def to_null(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    if text.lower() in {"nan", "none", "null"}:
+        return None
+    return text
+
+
+def normalize_date_for_seen_fields(value):
+    """
+    Convert values to yyyy-mm-dd when possible.
+    If blank/unparseable, return None or original trimmed value.
+    """
+    value = to_null(value)
+    if value is None:
+        return None
+
+    # try pandas parsing
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.isna(dt):
+        return str(value).strip()
+
+    return dt.strftime("%Y-%m-%d")
+
+
+def normalize_modify_dataframe(df_raw: pd.DataFrame):
+    """
+    For modify workflow:
+    - keep ALL columns
+    - normalize headers
+    - require po_id
+    - format first_seen / last_seen style columns as yyyy-mm-dd
+    - blanks -> None
+    """
+    original_cols = list(df_raw.columns)
+    sanitized_cols = [normalize_header(c) for c in original_cols]
+
+    df = df_raw.copy()
+    df.columns = sanitized_cols
+
+    dupes = pd.Series(df.columns)
+    duplicate_cols = dupes[dupes.duplicated()].tolist()
+    if duplicate_cols:
+        raise ValueError(
+            "Duplicate columns found after header normalization:\n  - "
+            + "\n  - ".join(sorted(set(duplicate_cols)))
+        )
+
+    if "po_id" not in df.columns:
+        raise ValueError(
+            "Modify mode requires a 'po_id' column in the selected file."
+        )
+
+    # clean all columns
+    for col in df.columns:
+        if "first_seen" in col or "last_seen" in col:
+            df[col] = df[col].map(normalize_date_for_seen_fields)
+        else:
+            df[col] = df[col].map(to_null)
+
+    # remove fully blank po_id rows
+    before = len(df)
+    df = df[df["po_id"].notna()].copy()
+    dropped_blank_po = before - len(df)
+
+    return df, original_cols, sanitized_cols, dropped_blank_po
+
+
+def add_missing_columns_from_df(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame, protected_cols=None):
+    """
+    Add new columns to SQLite table if they do not yet exist.
+    All added as TEXT for flexibility.
+    """
+    protected_cols = set(protected_cols or [])
+    existing_cols = set(get_existing_columns(conn, table_name))
+
+    cols_to_add = [
+        c for c in df.columns
+        if c not in existing_cols and c not in protected_cols
+    ]
+
+    for col in cols_to_add:
+        conn.execute(
+            f"ALTER TABLE {sqlite_quote_identifier(table_name)} "
+            f"ADD COLUMN {sqlite_quote_identifier(col)} TEXT"
+        )
+
+    conn.commit()
+    return cols_to_add
+
+
+def update_existing_rows_by_po_id(
+    conn: sqlite3.Connection,
+    table_name: str,
+    df: pd.DataFrame,
+    progress_callback=None,
+):
+    """
+    Update existing rows using po_id.
+    - only rows whose po_id already exists will be updated
+    - columns not present in file remain unchanged
+    - po_id itself is not updated
+    """
+    if df.empty:
+        return {
+            "rows_in_file": 0,
+            "rows_updated": 0,
+            "rows_not_found": 0,
+            "columns_added": [],
+        }
+
+    # make sure table has any new columns first
+    columns_added = add_missing_columns_from_df(
+        conn,
+        table_name,
+        df,
+        protected_cols={"po_id"}
+    )
+
+    existing_po_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT po_id FROM {sqlite_quote_identifier(table_name)} WHERE po_id IS NOT NULL"
+        ).fetchall()
+    }
+
+    updatable_df = df[df["po_id"].isin(existing_po_ids)].copy()
+    not_found_df = df[~df["po_id"].isin(existing_po_ids)].copy()
+
+    if updatable_df.empty:
+        return {
+            "rows_in_file": len(df),
+            "rows_updated": 0,
+            "rows_not_found": len(not_found_df),
+            "columns_added": columns_added,
+        }
+
+    update_cols = [c for c in updatable_df.columns if c != "po_id"]
+    if not update_cols:
+        return {
+            "rows_in_file": len(df),
+            "rows_updated": 0,
+            "rows_not_found": len(not_found_df),
+            "columns_added": columns_added,
+        }
+
+    set_clause = ", ".join(
+        f"{sqlite_quote_identifier(col)} = ?"
+        for col in update_cols
+    )
+
+    sql = f"""
+        UPDATE {sqlite_quote_identifier(table_name)}
+        SET {set_clause}
+        WHERE po_id = ?
+    """
+
+    params = []
+    total = len(updatable_df)
+
+    for idx, row in enumerate(updatable_df.itertuples(index=False), start=1):
+        row_dict = row._asdict()
+        values = [row_dict.get(col) for col in update_cols]
+        values.append(row_dict["po_id"])
+        params.append(tuple(values))
+
+        if progress_callback:
+            progress_callback(idx / total)
+
+    conn.executemany(sql, params)
+    conn.commit()
+
+    return {
+        "rows_in_file": len(df),
+        "rows_updated": len(updatable_df),
+        "rows_not_found": len(not_found_df),
+        "columns_added": columns_added,
+    }
 
 def ensure_pooling_order_table(conn: sqlite3.Connection, table_name: str):
     conn.execute(f"""
@@ -160,17 +345,17 @@ def get_expected_columns_for_import() -> set[str]:
 
 
 def normalize_header(col: str) -> str:
-    s = str(col).strip()
+    s = str(col).strip().lower()
+
+    # Treat common separators as spaces first
+    s = s.replace("_", " ")
+    s = s.replace("-", " ")
     s = s.replace("/", " ")
-    s = re.sub(r"[\-\–]+", " ", s)
-    s = re.sub(r"[_]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip().lower()
 
     mapping = {
         "lessor owner": "lessor_owner",
         "lessors": "lessor_owner",
         "owner standardized": "lessor_owner",
-
         "first name": "first_name",
         "middle name": "middle_name",
         "last name": "last_name",
@@ -179,12 +364,27 @@ def normalize_header(col: str) -> str:
         "target state": "target_state",
         "source url": "source_url",
         "serial number": "serial_number",
+        "po id": "po_id",
     }
+
+    # remove remaining symbols
+    s = re.sub(r"[^a-z0-9\s]", "", s)
+
+    # collapse repeated spaces
+    s = re.sub(r"\s+", " ", s).strip()
 
     if s in mapping:
         return mapping[s]
 
-    return s.replace(" ", "_")
+    s = s.replace(" ", "_")
+
+    if not s:
+        s = "unnamed_column"
+
+    if s[0].isdigit():
+        s = f"col_{s}"
+
+    return s
 
 def refresh_existing_pipedrive_matches(
     conn: sqlite3.Connection,
@@ -379,6 +579,128 @@ def refresh_existing_budb_matches(
 
     newly_matched = int(((changed["old_norm"] == "") & (changed["new_norm"] != "")).sum())
     changed_match = int(((changed["old_norm"] != "") & (changed["new_norm"] != "")).sum())
+
+    return {
+        "rows_checked": len(df_compare),
+        "rows_changed": len(changed),
+        "newly_matched": newly_matched,
+        "changed_match": changed_match,
+        "kept_old_when_no_new_match": kept_old_when_no_new_match,
+    }
+
+def refresh_existing_prod_matches(
+    conn: sqlite3.Connection,
+    table_name: str,
+    lookup_maps_prod,
+    progress_callback=None,
+):
+    """
+    Re-check existing pooling_order rows against the latest PROD data.
+
+    Rules:
+    - blank old ID + new match: save new ID
+    - existing old ID + different new match: replace old ID
+    - existing old ID + no new match: retain old ID
+    """
+    df_existing = pd.read_sql_query(f"""
+        SELECT
+            po_id,
+            lessor_owner,
+            first_name,
+            middle_name,
+            last_name,
+            address,
+            city,
+            state,
+            postal_code,
+            target_county,
+            target_state,
+            prod_id
+        FROM {sqlite_quote_identifier(table_name)}
+    """, conn)
+
+    if df_existing.empty:
+        return {
+            "rows_checked": 0,
+            "rows_changed": 0,
+            "newly_matched": 0,
+            "changed_match": 0,
+            "kept_old_when_no_new_match": 0,
+        }
+
+    df_matched = populate_prod_ids_in_df(
+        df_existing.drop(columns=["prod_id"], errors="ignore"),
+        lookup_maps_prod,
+        progress_callback=progress_callback,
+    )
+
+    df_compare = (
+        df_existing[["po_id", "prod_id"]]
+        .rename(columns={"prod_id": "old_prod_id"})
+        .merge(
+            df_matched[["po_id", "prod_id"]]
+            .rename(columns={"prod_id": "new_prod_id"}),
+            on="po_id",
+            how="left",
+        )
+    )
+
+    def norm(value):
+        if value is None:
+            return ""
+
+        value = str(value).strip()
+
+        if value.lower() in {"", "nan", "none", "null"}:
+            return ""
+
+        return value
+
+    df_compare["old_norm"] = df_compare["old_prod_id"].map(norm)
+    df_compare["new_norm"] = df_compare["new_prod_id"].map(norm)
+
+    # Update only when a new nonblank match exists and differs from old.
+    changed = df_compare[
+        (df_compare["new_norm"] != "") &
+        (df_compare["old_norm"] != df_compare["new_norm"])
+    ].copy()
+
+    kept_old_when_no_new_match = int(
+        (
+            (df_compare["old_norm"] != "") &
+            (df_compare["new_norm"] == "")
+        ).sum()
+    )
+
+    if not changed.empty:
+        updates = [
+            (row.new_norm, row.po_id)
+            for row in changed.itertuples(index=False)
+        ]
+
+        conn.executemany(
+            f"""
+                UPDATE {sqlite_quote_identifier(table_name)}
+                SET prod_id = ?
+                WHERE po_id = ?
+            """,
+            updates,
+        )
+        conn.commit()
+
+    newly_matched = int(
+        (
+            (changed["old_norm"] == "") &
+            (changed["new_norm"] != "")
+        ).sum()
+    )
+
+    changed_match = int(
+        (
+            (changed["old_norm"] != "") &
+            (changed["new_norm"] != "")
+        ).sum()
+    )
 
     return {
         "rows_checked": len(df_compare),
@@ -771,6 +1093,24 @@ class PoolingOrderImporterApp(ctk.CTk):
             command=self.start_import
         )
         self.import_btn.pack(pady=(6, 12), padx=10)
+        
+        self.modify_btn = ctk.CTkButton(
+            tab,
+            text="Modify Existing by PO ID",
+            fg_color=self.PANEL_BG,
+            hover_color="#334957",
+            command=self.start_modify
+        )
+        self.modify_btn.pack(pady=(0, 12), padx=10)
+
+        self.refresh_ids_btn = ctk.CTkButton(
+            tab,
+            text="Refresh Existing IDs",
+            fg_color=self.ACCENT,
+            hover_color=self.ACCENT_HOVER,
+            command=self.start_id_refresh,
+        )
+        self.refresh_ids_btn.pack(pady=(0, 12), padx=10)
 
     def clear_selected_files(self):
         self.input_paths = []
@@ -863,6 +1203,7 @@ class PoolingOrderImporterApp(ctk.CTk):
             self._log("[DB] No base DB found. Starting a NEW DB for today.")
 
         self.import_btn.configure(state="disabled")
+        self.modify_btn.configure(state="disabled")
         self.pick_file_btn.configure(state="disabled")
         self.progress_callback(0, "Initializing import workflow...")
 
@@ -872,7 +1213,66 @@ class PoolingOrderImporterApp(ctk.CTk):
             daemon=True
         ).start()
 
+    def start_modify(self):
+        self._divider()
 
+        if not self.input_paths:
+            messagebox.showwarning("Missing input", "Please select one or more CSV/XLSX files.")
+            return
+
+        db_path, copied_from, mode = get_daily_db_path("pooling_order")
+        self._log(f"[DB] Using daily DB: {db_path}")
+
+        if mode == "copied":
+            self._log(f"[DB] Copied base DB: {copied_from}")
+        elif mode == "existing":
+            self._log("[DB] Today's DB already exists. Continuing modify..")
+        else:
+            self._log("[DB] No base DB found. Starting a NEW DB for today.")
+
+        self.import_btn.configure(state="disabled")
+        self.modify_btn.configure(state="disabled")
+        self.pick_file_btn.configure(state="disabled")
+        self.progress_callback(0, "Initializing modify workflow...")
+
+        threading.Thread(
+            target=self._modify_worker,
+            args=(db_path, self.input_paths, "pooling_order"),
+            daemon=True
+        ).start()
+
+    def start_id_refresh(self):
+        self._divider()
+
+        db_path, copied_from, mode = get_daily_db_path("pooling_order")
+        self._log(f"[DB] Using daily DB: {db_path}")
+
+        if mode == "copied":
+            self._log(f"[DB] Copied base DB: {copied_from}")
+        elif mode == "existing":
+            self._log("[DB] Today's DB already exists. Refreshing IDs.")
+        else:
+            messagebox.showwarning(
+                "No existing database",
+                "No existing Pooling Order database was found to refresh."
+            )
+            return
+
+        self.import_btn.configure(state="disabled")
+        self.modify_btn.configure(state="disabled")
+        self.refresh_ids_btn.configure(state="disabled")
+        self.pick_file_btn.configure(state="disabled")
+
+        self.progress_callback(
+            0,
+            "Preparing to refresh BUDB, PROD, and Deal IDs..."
+        )
+
+        threading.Thread(
+            target=self._refresh_ids_worker,
+            args=(db_path, "pooling_order"),
+            daemon=True,
+        ).start()
 
     def _import_worker(self, db_path, input_paths, table_name):
         try:
@@ -1021,10 +1421,215 @@ class PoolingOrderImporterApp(ctk.CTk):
 
         finally:
             self.after(0, lambda: self.import_btn.configure(state="normal"))
+            self.after(0, lambda: self.modify_btn.configure(state="normal"))
             self.after(0, lambda: self.pick_file_btn.configure(state="normal"))
             self._divider()
             self.progress_callback(0, "Waiting for action...")
 
+    def _modify_worker(self, db_path, input_paths, table_name):
+        try:
+            conn = connect_sqlite(db_path)
+            try:
+                ensure_pooling_order_table(conn, table_name)
+
+                total_files = len(input_paths)
+                total_updated = 0
+                total_not_found = 0
+                all_added_columns = []
+
+                for idx, input_path in enumerate(input_paths, start=1):
+                    filename = os.path.basename(input_path)
+                    self.progress_callback(0, f"[{idx}/{total_files}] Reading for modify: {filename}")
+
+                    df_raw = read_input_file(input_path)
+                    if df_raw.empty:
+                        self._log(f"[SKIP] {filename} has no rows.")
+                        continue
+
+                    self.progress_callback(0, f"[{idx}/{total_files}] Normalizing headers / values...")
+                    df, original_cols, sanitized_cols, dropped_blank_po = normalize_modify_dataframe(df_raw)
+
+                    self._log(f"[{idx}/{total_files}] {filename}: {len(df):,} row(s) ready for modify")
+                    self._log(f"[MAP] Columns: {len(original_cols)} original -> {len(sanitized_cols)} normalized")
+                    if dropped_blank_po:
+                        self._log(f"[CLEAN] Dropped rows with blank po_id: {dropped_blank_po:,}")
+
+                    self.progress_callback(0, f"[{idx}/{total_files}] Updating existing rows by po_id...")
+                    stats = update_existing_rows_by_po_id(
+                        conn,
+                        table_name,
+                        df,
+                        progress_callback=lambda frac: self.progress_callback(frac)
+                    )
+
+                    total_updated += stats["rows_updated"]
+                    total_not_found += stats["rows_not_found"]
+                    all_added_columns.extend(stats["columns_added"])
+
+                    if stats["columns_added"]:
+                        self._log(
+                            f"[SCHEMA] Added new columns: {', '.join(stats['columns_added'])}"
+                        )
+
+                    self._log(
+                        f"[DONE] {filename} | Updated: {stats['rows_updated']:,} | "
+                        f"PO IDs not found: {stats['rows_not_found']:,}"
+                    )
+
+                unique_added = sorted(set(all_added_columns))
+
+                self._log(f"[DONE] Modify workflow finished for: {os.path.basename(db_path)}")
+                self._log(f"[DONE] Total rows updated: {total_updated:,}")
+                self._log(f"[DONE] Total PO IDs not found: {total_not_found:,}")
+                if unique_added:
+                    self._log(f"[DONE] New DB columns added this run: {', '.join(unique_added)}")
+
+                self.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "Success",
+                        f"Modified DB:\n{db_path}\n\n"
+                        f"Rows updated: {total_updated:,}\n"
+                        f"PO IDs not found: {total_not_found:,}\n"
+                        f"New columns added: {len(unique_added)}"
+                    )
+                )
+
+            finally:
+                conn.close()
+
+        except Exception as e:
+            err_msg = str(e)
+            self._log(f"[ERROR] {err_msg}")
+            self._ui_error("Error", err_msg)
+
+        finally:
+            self.after(0, lambda: self.import_btn.configure(state="normal"))
+            self.after(0, lambda: self.modify_btn.configure(state="normal"))
+            self.after(0, lambda: self.pick_file_btn.configure(state="normal"))
+            self._divider()
+            self.progress_callback(0, "Waiting for action...")
+
+    def _refresh_ids_worker(self, db_path, table_name):
+        try:
+            conn = connect_sqlite(db_path)
+
+            try:
+                ensure_pooling_order_table(conn, table_name)
+                base_dir = get_app_base_dir()
+
+                # BUDB
+                self.progress_callback(0, "[1/3] Loading BUDB lookup data...")
+                lookup_maps_budb, budb_meta = load_budb_lookup_maps(base_dir)
+
+                self.progress_callback(0, "[1/3] Refreshing existing budb_id values...")
+                budb_stats = refresh_existing_budb_matches(
+                    conn,
+                    table_name,
+                    lookup_maps_budb,
+                    progress_callback=lambda frac: self.progress_callback(frac),
+                )
+
+                self._log(
+                    f"[BUDB] Checked: {budb_stats['rows_checked']:,} | "
+                    f"Changed: {budb_stats['rows_changed']:,} | "
+                    f"Newly matched: {budb_stats['newly_matched']:,} | "
+                    f"Changed match: {budb_stats['changed_match']:,} | "
+                    f"Retained old: "
+                    f"{budb_stats['kept_old_when_no_new_match']:,}"
+                )
+
+                # PROD
+                self.progress_callback(0, "[2/3] Loading PROD lookup data...")
+                lookup_maps_prod, prod_meta = load_prod_lookup_maps(
+                    MYSQL_CONFIG,
+                    base_dir,
+                    force_rebuild=False,
+                )
+
+                self.progress_callback(0, "[2/3] Refreshing existing prod_id values...")
+                prod_stats = refresh_existing_prod_matches(
+                    conn,
+                    table_name,
+                    lookup_maps_prod,
+                    progress_callback=lambda frac: self.progress_callback(frac),
+                )
+
+                self._log(
+                    f"[PROD] Checked: {prod_stats['rows_checked']:,} | "
+                    f"Changed: {prod_stats['rows_changed']:,} | "
+                    f"Newly matched: {prod_stats['newly_matched']:,} | "
+                    f"Changed match: {prod_stats['changed_match']:,} | "
+                    f"Retained old: "
+                    f"{prod_stats['kept_old_when_no_new_match']:,}"
+                )
+
+                # Pipedrive
+                self.progress_callback(0, "[3/3] Loading Pipedrive lookup data...")
+                lookup_maps_pd, pd_meta = load_pipedrive_lookup_maps(base_dir)
+
+                self.progress_callback(0, "[3/3] Refreshing existing deal_id values...")
+                deal_stats = refresh_existing_pipedrive_matches(
+                    conn,
+                    table_name,
+                    lookup_maps_pd,
+                    progress_callback=lambda frac: self.progress_callback(frac),
+                )
+
+                self._log(
+                    f"[PIPEDRIVE] Checked: {deal_stats['rows_checked']:,} | "
+                    f"Changed: {deal_stats['rows_changed']:,} | "
+                    f"Newly matched: {deal_stats['newly_matched']:,}"
+                )
+
+                self._log(
+                    f"[DONE] ID refresh completed: "
+                    f"{os.path.basename(db_path)}"
+                )
+
+                summary = (
+                    "Existing Pooling Order IDs refreshed.\n\n"
+                    f"BUDB IDs changed: {budb_stats['rows_changed']:,}\n"
+                    f"PROD IDs changed: {prod_stats['rows_changed']:,}\n"
+                    f"Deal IDs changed: {deal_stats['rows_changed']:,}"
+                )
+
+                self.after(
+                    0,
+                    lambda msg=summary: messagebox.showinfo(
+                        "Refresh complete",
+                        msg,
+                    )
+                )
+
+            finally:
+                conn.close()
+
+        except Exception as e:
+            error_message = str(e)
+            self._log(f"[ERROR] {error_message}")
+            self._ui_error("Refresh error", error_message)
+
+        finally:
+            self.after(
+                0,
+                lambda: self.import_btn.configure(state="normal")
+            )
+            self.after(
+                0,
+                lambda: self.modify_btn.configure(state="normal")
+            )
+            self.after(
+                0,
+                lambda: self.refresh_ids_btn.configure(state="normal")
+            )
+            self.after(
+                0,
+                lambda: self.pick_file_btn.configure(state="normal")
+            )
+
+            self._divider()
+            self.progress_callback(0, "Waiting for action...")
 
 if __name__ == "__main__":
     app = PoolingOrderImporterApp()

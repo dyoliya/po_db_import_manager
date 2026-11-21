@@ -157,6 +157,7 @@ address_replacements = {
     r"\bTRAIL\b": "TRL",
     r"\bWEST\b": "W",
     r"\bP\.?\s*O\.?\b": "PO",
+    r"\bFREEWAY\b": "FWY",
 }
 
 OWNER_REPLACEMENTS = [(re.compile(p, flags=re.IGNORECASE), r) for p, r in owner_changer.items()]
