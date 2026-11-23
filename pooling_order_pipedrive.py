@@ -267,6 +267,42 @@ def build_key(owner, address, city, state) -> Optional[tuple[str, str, str, str]
 
     return (owner, address, city, state)
 
+def split_pipe_values(value):
+    if value is None:
+        return []
+
+    s = str(value).strip()
+    if not s or s.lower() in {"nan", "none", "null"}:
+        return []
+
+    return [x.strip() for x in s.split("|") if x.strip()]
+
+
+def normalize_id_value(value):
+    if value is None:
+        return ""
+
+    s = str(value).strip()
+
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+
+    return s
+
+
+def normalize_serial_value(value):
+    if value is None:
+        return ""
+
+    s = str(value).strip().upper()
+
+    if s.lower() in {"", "nan", "none", "null"}:
+        return ""
+
+    # ignore dashes/spaces/special chars
+    s = re.sub(r"[^A-Z0-9]", "", s)
+
+    return s
 
 # ============================================
 # FETCH FROM PIPEDRIVE
@@ -285,12 +321,24 @@ def load_pipedrive_lookup_maps(base_dir: str | Path):
         raise FileNotFoundError(f"Pipedrive local cache CSV not found: {csv_path}")
 
     df_raw = pd.read_csv(csv_path, dtype=str, keep_default_na=False, na_filter=False).fillna("")
+    # Exclude Test Deals from Pipedrive matching
+    if "Deal - Label" in df_raw.columns:
+        df_raw = df_raw[
+            ~df_raw["Deal - Label"]
+                .astype(str)
+                .str.contains("Test Deal", case=False, na=False)
+        ].copy()
 
     required_cols = {
         "Deal - ID",
         "Deal - Title",
         "Deal - Contact person",
         "Person - Mailing Address",
+        "Deal - Pooling Order ID",
+        "Deal - Serial Number",
+        "Deal - Label",
+        "Deal - Pipeline",
+        "Deal - Stage",
     }
     missing = sorted(required_cols - set(df_raw.columns))
     if missing:
@@ -304,6 +352,8 @@ def load_pipedrive_lookup_maps(base_dir: str | Path):
         "title": df_raw["Deal - Title"].astype(str).str.strip(),
         "contact_name": df_raw["Deal - Contact person"].astype(str).str.strip(),
         "mailing_address_raw": df_raw["Person - Mailing Address"].astype(str).str.strip(),
+        "deal_po_id": df_raw["Deal - Pooling Order ID"].astype(str).str.strip(),
+        "deal_serial_number": df_raw["Deal - Serial Number"].astype(str).str.strip(),
     })
 
     # overwrite local sqlite cache from CSV
@@ -327,17 +377,11 @@ def load_pipedrive_lookup_maps(base_dir: str | Path):
     return lookup_maps, metadata
 
 def build_lookup_maps(df: pd.DataFrame):
-    """
-    Build lookup structures using:
-    1. full Deal - Contact person + mailing address
-    2. deal title containment check + same mailing address/city/state
-
-    IMPORTANT:
-    - Deal - Contact person is NOT split into first/last
-    - Deal title is NOT split either
-    """
     contact_full_combo = defaultdict(set)
     title_address_rows = []
+
+    po_id_lookup = defaultdict(set)
+    serial_number_lookup = defaultdict(set)
 
     for row in df.itertuples(index=False):
         if pd.isna(row.deal_id):
@@ -353,7 +397,6 @@ def build_lookup_maps(df: pd.DataFrame):
         city_norm = normalize_basic_text(city)
         state_norm = normalize_basic_text(state)
 
-        # Full Deal - Contact person + mailing address
         key_contact_full = build_name_address_key(
             row.contact_name,
             address_norm,
@@ -363,7 +406,6 @@ def build_lookup_maps(df: pd.DataFrame):
         if key_contact_full:
             contact_full_combo[key_contact_full].add(deal_id)
 
-        # Store normalized title + normalized mailing address for containment check later
         title_norm = normalize_owner_text(row.title)
         if title_norm and address_norm:
             title_address_rows.append({
@@ -374,9 +416,23 @@ def build_lookup_maps(df: pd.DataFrame):
                 "state": state_norm,
             })
 
+        # Deal - Pooling Order ID lookup
+        for po_id in split_pipe_values(getattr(row, "deal_po_id", "")):
+            po_id_norm = normalize_id_value(po_id)
+            if po_id_norm:
+                po_id_lookup[po_id_norm].add(deal_id)
+
+        # Deal - Serial Number lookup
+        for serial in split_pipe_values(getattr(row, "deal_serial_number", "")):
+            serial_norm = normalize_serial_value(serial)
+            if serial_norm:
+                serial_number_lookup[serial_norm].add(deal_id)
+
     return {
         "contact_full_combo": contact_full_combo,
         "title_address_rows": title_address_rows,
+        "po_id_lookup": po_id_lookup,
+        "serial_number_lookup": serial_number_lookup,
     }
 
 

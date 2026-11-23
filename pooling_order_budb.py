@@ -193,7 +193,7 @@ def build_match_key(owner, address, city, state) -> Optional[Tuple[str, str, str
     city_n = normalize_city_state_text(raw_key[2])
     state_n = normalize_city_state_text(raw_key[3])
 
-    if not address_n:
+    if not all((owner_n, address_n, city_n, state_n)):
         _MATCH_KEY_CACHE[raw_key] = None
         return None
 
@@ -215,6 +215,36 @@ def deserialize_key(key_str: str) -> Tuple[str, str, str, str]:
 # =========================================================
 # BUDB FILE DISCOVERY
 # =========================================================
+
+def validate_budb_file(value: str | Path) -> Path:
+    if not str(value).strip():
+        raise ValueError("Select a Bottoms Up .db file first.")
+
+    path = Path(value).expanduser().resolve()
+
+    if path.suffix.lower() != ".db" or not path.is_file():
+        raise ValueError("Select an existing .db file.")
+
+    conn = connect_sqlite_readonly(path)
+
+    try:
+        columns = get_existing_columns(conn, "bottoms_up")
+
+        if not columns:
+            raise ValueError("This file has no bottoms_up table.")
+
+        validate_budb_columns(columns)
+
+        if conn.execute(
+            "SELECT 1 FROM bottoms_up LIMIT 1"
+        ).fetchone() is None:
+            raise ValueError(
+                "The bottoms_up table contains no records."
+            )
+    finally:
+        conn.close()
+
+    return path
 
 def get_single_budb_path(base_dir: str | Path) -> Path:
     base_dir = Path(base_dir)
@@ -243,7 +273,11 @@ def get_single_budb_path(base_dir: str | Path) -> Path:
 # =========================================================
 
 def connect_sqlite_readonly(db_path: str | Path) -> sqlite3.Connection:
-    return sqlite3.connect(str(db_path))
+    path = Path(db_path).expanduser().resolve()
+    return sqlite3.connect(
+        path.as_uri() + "?mode=ro",
+        uri=True,
+    )
 
 
 def get_existing_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
@@ -371,6 +405,8 @@ def save_lookup_maps_to_cache(conn: sqlite3.Connection, lookup_maps: dict, budb_
 
     rows_to_insert = []
     for combo_name, combo_map in lookup_maps.items():
+        if combo_name in {"id_to_group", "group_to_ids"}:
+            continue
         for key_tuple, budb_ids in combo_map.items():
             key_str = serialize_key(key_tuple)
             for budb_id in budb_ids:
@@ -538,14 +574,18 @@ def build_lookup_maps_from_budb_df(budb_df: pd.DataFrame) -> dict:
         "group_to_ids": group_to_ids,
     }
 
-def load_budb_lookup_maps(base_dir: str | Path):
+def load_budb_lookup_maps(
+    base_dir: str | Path,
+    *,
+    budb_path: str | Path,
+):
     """
     Safe cache strategy:
     - if BUDB file path + mtime + size are unchanged, load lookup maps from cache
     - otherwise rebuild lookup maps from BUDB and refresh cache
     """
     base_dir = Path(base_dir)
-    budb_path = get_single_budb_path(base_dir)
+    budb_path = validate_budb_file(budb_path)
     budb_signature = get_budb_file_signature(budb_path)
 
     cache_path = get_cache_path(base_dir)
@@ -556,7 +596,28 @@ def load_budb_lookup_maps(base_dir: str | Path):
 
         if cache_is_current(cache_conn, budb_signature):
             lookup_maps, metadata = load_lookup_maps_from_cache(cache_conn)
+
+            # Rebuild contact_group expansion maps because old cache does not store these.
+            budb_df, table_name = load_budb_dataframe(budb_path)
+
+            id_to_group = {}
+            group_to_ids = defaultdict(set)
+
+            for row in budb_df.itertuples(index=False):
+                budb_id = "" if pd.isna(row.budb_id) else str(row.budb_id).strip()
+                contact_group_id = "" if pd.isna(row.contact_group_id) else str(row.contact_group_id).strip()
+
+                if budb_id and contact_group_id and contact_group_id.lower() not in {"nan", "none", "null"}:
+                    id_to_group[budb_id] = contact_group_id
+                    group_to_ids[contact_group_id].add(budb_id)
+
+            lookup_maps["id_to_group"] = id_to_group
+            lookup_maps["group_to_ids"] = group_to_ids
+
             metadata["cache_path"] = str(cache_path)
+            metadata["table_name"] = table_name
+            metadata["rows_loaded"] = len(budb_df)
+
             return lookup_maps, metadata
 
         budb_df, table_name = load_budb_dataframe(budb_path)
@@ -581,35 +642,38 @@ def load_budb_lookup_maps(base_dir: str | Path):
 # MATCHING
 # =========================================================
 
-def match_budb_ids_for_pooling_row(row, lookup_maps: dict) -> Optional[str]:
-    key = build_match_key(
-        getattr(row, "lessor_owner", ""),
-        getattr(row, "address", ""),
-        getattr(row, "city", ""),
-        getattr(row, "state", ""),
-    )
-
-    if not key:
-        return None
+def match_budb_ids_for_po_row(row, lookup_maps: dict) -> Optional[str]:
+    po_combos = [
+        ("lessor_owner", "address", "city", "state"),
+        ("lessor_owner", "add_address1", "add_address1_city", "add_address1_state"),
+    ]
 
     direct_matches: Set[str] = set()
 
-    for combo_name in (
-        "combo_1_owner_input",
-        "combo_2_ownerstd_input",
-        "combo_3_ownerstd_md",
-        "combo_4_owner_md",
-    ):
-        combo_map = lookup_maps.get(combo_name, {})
-        combo_matches = combo_map.get(key, set())
-        new_matches = combo_matches - direct_matches
-        if new_matches:
-            direct_matches.update(new_matches)
+    for owner_col, address_col, city_col, state_col in po_combos:
+        key = build_match_key(
+            getattr(row, owner_col, ""),
+            getattr(row, address_col, ""),
+            getattr(row, city_col, ""),
+            getattr(row, state_col, ""),
+        )
+
+        if not key:
+            continue
+
+        for combo_name in (
+            "combo_1_owner_input",
+            "combo_2_ownerstd_input",
+            "combo_3_ownerstd_md",
+            "combo_4_owner_md",
+        ):
+            combo_map = lookup_maps.get(combo_name, {})
+            direct_matches.update(combo_map.get(key, set()))
+
 
     if not direct_matches:
         return None
 
-    # Expand through contact_group_id only when non-null
     id_to_group = lookup_maps.get("id_to_group", {})
     group_to_ids = lookup_maps.get("group_to_ids", {})
 
@@ -620,24 +684,108 @@ def match_budb_ids_for_pooling_row(row, lookup_maps: dict) -> Optional[str]:
         if contact_group_id:
             expanded_matches.update(group_to_ids.get(contact_group_id, set()))
 
-    if not expanded_matches:
-        return None
-
     def sort_key(x: str):
         return (0, int(x)) if x.isdigit() else (1, x)
 
     return " | ".join(sorted(expanded_matches, key=sort_key))
 
 
-def populate_budb_ids_in_df(df: pd.DataFrame, lookup_maps: dict, progress_callback=None) -> pd.DataFrame:
+def populate_budb_ids_in_df(
+    df: pd.DataFrame,
+    lookup_maps: dict,
+    progress_callback=None,
+):
     df = df.copy()
     total = len(df)
-    budb_ids = []
 
-    for idx, row in enumerate(df.itertuples(index=False), start=1):
-        budb_ids.append(match_budb_ids_for_pooling_row(row, lookup_maps))
+    budb_values = []
+    group_values = []
+    audit_records = []
+
+    id_to_group = lookup_maps.get("id_to_group", {})
+
+    for position, row in enumerate(df.itertuples(index=False)):
+        # Preserve PO's existing matching and group-expansion rules.
+        original = match_budb_ids_for_po_row(row, lookup_maps)
+        original_ids = original.split(" | ") if original else []
+
+        groups = {}
+        null_ids = []
+
+        for budb_id in original_ids:
+            raw_group = id_to_group.get(budb_id)
+
+            if raw_group is None or pd.isna(raw_group):
+                null_ids.append(budb_id)
+                continue
+
+            value = str(raw_group).strip()
+
+            if not value or value.lower() in {"nan", "none", "null"}:
+                null_ids.append(budb_id)
+                continue
+
+            if not re.fullmatch(r"[0-9]+(?:\.0+)?", value):
+                raise ValueError(
+                    f"Invalid BUDB contact_group_id {value!r} "
+                    f"for ID {budb_id}."
+                )
+
+            group = int(value.split(".")[0])
+            groups.setdefault(group, []).append(budb_id)
+
+        selected = min(groups) if groups else None
+
+        retained = (
+            groups[selected]
+            if selected is not None
+            else original_ids
+        )
+
+        final_ids = " | ".join(retained) if retained else None
+        final_group = str(selected) if selected is not None else None
+
+        budb_values.append(final_ids)
+        group_values.append(final_group)
+
+        # Match DEO: audit multiple distinct non-NULL groups.
+        if len(groups) > 1:
+            kept = set(retained)
+
+            audit_records.append({
+                "sheet_row": int(df.index[position]) + 2,
+                "po_id": getattr(row, "po_id", None),
+                "original_budb_id": original,
+                "original_contact_group_ids": " | ".join(
+                    str(group) for group in sorted(groups)
+                ),
+                "contact_group_count": len(groups),
+                "budb_ids_by_group": "; ".join(
+                    f"{group}: {' | '.join(groups[group])}"
+                    for group in sorted(groups)
+                ),
+                "budb_ids_without_group": " | ".join(null_ids),
+                "selected_contact_group_id": final_group,
+                "final_budb_id": final_ids,
+                "removed_budb_id": " | ".join(
+                    item for item in original_ids if item not in kept
+                ),
+            })
+
         if progress_callback and total:
-            progress_callback(idx / total)
+            progress_callback((position + 1) / total)
 
-    df["budb_id"] = budb_ids
-    return df
+    df["budb_id"] = pd.Series(
+        budb_values,
+        index=df.index,
+        dtype=object,
+    )
+
+    # Derive the group from BUDB, ignoring incoming Sheet group values.
+    df["contact_group_id"] = pd.Series(
+        group_values,
+        index=df.index,
+        dtype=object,
+    )
+
+    return df, pd.DataFrame(audit_records)
