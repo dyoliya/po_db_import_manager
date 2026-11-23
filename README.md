@@ -1,123 +1,102 @@
-# Pooling Order DB Import Manager
+# PO DB Builder
 
-PO DB Import Manager is a desktop data consolidation tool for pooling-order mineral owner records. It imports data from separately maintained Google-Sheets exports, normalizes owner and address data, enriches records with BUDB / PROD / Pipedrive match IDs, and writes the final dataset into a local SQLite database for fast and consistent lookup.
+**PO DB Builder** is a desktop utility (built with Python) that implements a
+**controlled Extract–Transform–Load (ETL) ingestion workflow** for pooling-order mineral owner records.
+
+It ingests pooling-order rows from a shared Google Sheet, cleans and standardizes them, matches each record against the company's Pipedrive deals and BUDB (Bottoms Up Database) mineral-ownership records, and persists the result into a versioned, daily SQLite database for long-term retention and reporting.
 
 ---
 
-![Version](https://img.shields.io/badge/version-1.0.0-ffab4c?style=for-the-badge&logo=python&logoColor=white)
+![Version](https://img.shields.io/badge/version-2.0.0-ffab4c?style=for-the-badge&logo=python&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.11%2B-273946?style=for-the-badge&logo=python&logoColor=ffab4c)
 ![Status](https://img.shields.io/badge/status-active-273946?style=for-the-badge&logo=github&logoColor=ffab4c)
 
 ---
 
 ## 🚧 Problem Statement / Motivation
-Pooling-order source data is maintained across separate Google Sheets files. That setup makes it hard to search and reconcile records quickly across teams.
 
-This tool solves that by consolidating those files into a SQLite-backed lookup database that:
-- aligns with existing SQLite-based internal workflows,
-- makes mineral owner (MO) lookup easier for the Pipedrive team,
-- supports consistent cross-system matching (BUDB, .work, Pipedrive), and
-- remains read-only from the user perspective (users cannot directly edit source Google Sheets through this tool).
+The pooling-order dataset is maintained on the **`po_db`** tab of a shared Google Sheet that multiple team members contribute to, with inconsistent formatting, duplicate entries, and no link back to the company's existing systems of record (Pipedrive deals, BUDB ownership data).
+
+Manually cross-referencing each incoming owner against Pipedrive and BUDB to check "do we already have a deal or ownership record for this person" is slow and error-prone at volume, and without a durable, versioned database there is no reliable way to track what changed between imports or recover from a bad run.
+
+To close this gap, a repeatable ingestion pipeline is required — one that standardizes incoming data, automatically links it to existing Pipedrive deals and BUDB records, and stores the result in a daily, auditable database.
+
+PO DB Builder addresses this by enforcing a controlled ETL pipeline:
+1. Extract pooling-order records from the shared Google Sheet's `po_db` tab.
+2. Clean and standardize columns, phone numbers, and dates, flagging any suspicious data loss for audit.
+3. Match each record to a Pipedrive deal ID and a BUDB ID using cached reference data.
+4. Sync the result into a daily-versioned SQLite database, tracking inserts/updates/deletes.
+5. Write matched IDs, serial numbers, and upload dates back to the Google Sheet and generate audit/report files for review.
 
 ---
 
 ## ✨ Features
-
-### Core Import and Consolidation
-- Imports pooling-order files and maps headers to a standardized schema.
-- Creates/rolls daily SQLite DB files with automatic archiving of older versions.
-- Preserves stable row identity using `po_id`.
-- Supports optional serial number intake and auto-assignment when missing.
-
-### Matching and Enrichment
-- Normalizes owner names, addresses, city/state fields for deterministic matching.
-- Matches and populates:
-  - `budb_id` from BUDB SQLite,
-  - `prod_id` from PROD contact/address data,
-  - `deal_id` from local Pipedrive cache CSV.
-- Caches lookup maps locally in SQLite for faster repeated runs.
-- Refreshes BUDB matches for existing rows using latest lookup data.
-- Refreshes Pipedrive matches for existing rows using latest cache data.
-- Keeps old match values when no new match is found, based on matching rules defined in each standalone matcher.
-
-### Standalone Companion Utilities
-- Includes a separate database comparison / change-tracking utility for auditing differences between old and new PO DB versions.
-- Logs added rows, deleted rows, modified fields, and schema-level changes into `pooling_order_action_log`.
-- Carries forward prior log history into the new database when available.
-- Supports version-to-version traceability without changing the main import workflow.
-
+- **Google Sheets ingestion**: reads live data from a shared Google Sheet (tab must be named `po_db`) via a Google service account, with hyperlink extraction (rich-text/chip/link metadata) and a header-capture mode that guards against a link's display text leaking in as a column header; each download is re-read twice (and the Sheet's `modifiedTime` re-checked) to confirm nothing changed mid-capture, and is backed up locally under `input/google_sheet_backups/` (one subfolder per spreadsheet ID, as a timestamped `.xlsx` snapshot plus a JSON snapshot of the raw cell data) for traceability.
+- **Data cleaning**: column name sanitization, phone number and date normalization (including numeric Excel date serials), and a NULL-conversion audit for anything that looks like unintended data loss.
+- **Stable row identity**: incoming rows are matched back to existing database rows by `po_id` (format `porec_XXXXXX`); new rows are assigned the next sequential `po_id` and serial number (format `PO-XXXX`), with both sequences recovered from the database itself (or its action-log history) if the running counters aren't already cached.
+- **Pipedrive deal matching** against a Pipedrive deals cache, downloaded automatically via the Pipedrive API (PO ID, serial number, name + address, and deal-title + address matching, each tracked separately in a per-row audit of which method(s) matched), with a SQLite-backed lookup cache for speed.
+- **BUDB ID matching** against a BUDB reference database **you select each session** on the **Bottoms Up** tab (owner name + address matching across both the primary and secondary address fields), with its own signature-based lookup cache that rebuilds only when the selected file changes.
+  - **BUDB contact-group auto-resolution**: if a matched owner's BUDB IDs span more than one distinct `contact_group_id`, the app automatically keeps only the IDs belonging to the lowest-numbered group and records the full decision (all groups seen, which IDs were kept/removed) in a `budb_group_selection` audit sheet for review.
+- **Combined-county enrichment**: derives a `combined_counties` value from each row's target county and state.
+- **Pre-flight "Check references"**: validates Google Sheet access/permissions and content (headers, data rows), the Pipedrive API token, the BUDB file, and local storage (required folders, a single active database, and that it's readable), before enabling the build button, so a bad credential or file issue is caught before any database changes are made.
+- **Tracked, crash-safe database builds** (`po_build_state.py`):
+  - Auto-creates/copies forward a new dated DB each day from the most recent prior one (same-day re-runs continue syncing into that day's file).
+  - Every build attempt first archives a consistent snapshot of the current database into `database/previous_versions/<build_id>/`, before any changes are made.
+  - If a build fails partway through (and no Google writeback has started yet), the app automatically restores the pre-build snapshot so the active database is never left in a half-written state.
+  - Syncs rows by `po_id`, reporting inserted / updated / unchanged / deleted counts. Existing `prod_id` and `source_url` values are preserved for matched rows.
+  - Build status (`building` / `ready_for_log` / `complete` / `rolled_back` / `recovery_required`) is tracked both in `config/build_state.json` and inside the database itself, so the UI's **Build DB** / **Update Action Log** buttons stay in sync with what actually happened.
+- **Google Sheets writeback**: after a successful import, writes `po_id`, serial numbers, and upload dates back to the source sheet, with a pending/completed record so an interrupted writeback can be recovered instead of silently lost.
+- **Integrated action log**: after a build completes, clicking **Update Action Log** diffs the before/after database snapshots and records every schema change, added row, deleted row, and modified field into a persistent `pooling_order_action_log` table — no manual file copying required.
+- **Baseline snapshot / test-run safety net** (`initialize_po_baseline.py`): a manually-run, standalone script that stamps a known-good, already-tracked database as the official baseline and backs it up to `database/previous_versions/`, so a confirmed-stable version can be restored if a test run needs to be thrown away. It requires the target file to already contain a populated `pooling_order` table with its full `pooling_order_action_log` history — see **Baseline Snapshots & Test Runs** below.
+- **Interrupted-writeback recovery** (`po_writeback.py --apply`): inspects an interrupted build's journaled Google writeback, re-downloads the Sheet, confirms the cells it needs to write haven't been changed by anyone else since the original capture, and only then replays or confirms the writeback before marking the build complete.
+- **Single-process locking** (`po_run_lock.py`): the app and the baseline initializer both take an exclusive file lock, so two of these processes can't run against the same project folder at once.
+- **Audit & reporting output**: a combined NULL-conversion + BUDB group-selection audit workbook, a deal-match audit, and a PO-associated-deals report are generated automatically after each import.
+- **Operator-friendly desktop UI** with file/token/sheet selection, reference status indicators, progress bar, and a live activity log.
 ---
 
 ## 🧠 Logic Flow
 
-### A. Main Import Workflow
-1. **Input acquisition**
-   - User provides pooling-order input files (originating from separate Google Sheets exports).
+### Import / build flow
+1. User clicks **Check references** — validates the Google Sheet's access/permissions and data, the Pipedrive API token, the selected BUDB file, and local storage, without writing anything. The **Build DB** button stays disabled until this passes.
+2. User pastes the Google Sheet URL (its `po_db` tab is read) and clicks **Build DB**.
+3. `prepare_build()` (`po_build_state.py`) resolves today's database (`database/YYYY-MM-DD-pooling_order.db`):
+   - Archives a consistent snapshot of whatever database currently exists into `database/previous_versions/<build_id>/`, **before** any changes are made.
+   - If today's file doesn't exist yet, copies it forward from that snapshot.
+   - Records the build as `building` in `config/build_state.json` and inside the database itself.
+4. For the Google Sheet:
+   - Downloads the `po_db` tab, verifies the sheet hasn't changed mid-download, skips rows with no meaningful data, and saves a timestamped local backup copy to `input/google_sheet_backups/<spreadsheet_id>/`.
+   - Cleans and standardizes columns, phone numbers, and dates; records any suspicious NULL conversions for audit.
+   - Allocates/confirms each row's `po_id` and `serial_number` against the active database.
+   - Matches each row to a **Pipedrive deal ID** using the Pipedrive cache (`cache/pipedrive_local_cache.csv`, refreshed automatically via the Pipedrive API).
+   - Matches each row to a **BUDB ID** using the BUDB `.db` file selected on the **Bottoms Up** tab; if the match spans multiple `contact_group_id` values, auto-resolves to the lowest group and logs the decision.
+   - Derives `combined_counties` from the row's target county and state.
+5. Syncs rows into the daily table keyed by `po_id`, assigning `date_uploaded` as needed, and reports inserted/updated/unchanged/deleted counts.
+6. Writes `po_id`, serial numbers, and upload dates back to the sheet, tracking a pending → completed writeback record so a failed writeback can be resumed safely.
+7. On success, `finish_build()` marks the build `ready_for_log` and retires the prior active file (its pre-build copy already lives in `database/previous_versions/`). On failure, `fail_build()` automatically restores the pre-build snapshot (unless a Google writeback had already started, in which case it's left as `recovery_required` for manual review) — see **Troubleshooting** below.
+8. Saves output artifacts:
+   - `audit/` — a combined NULL-conversion + BUDB group-selection audit workbook (only if either kind of issue was found).
+   - `existing_deals/` — deal-match audit and the PO-associated-deals report.
 
-2. **Schema normalization**
-   - Headers are normalized (e.g., `Lessor Owner` → `lessor_owner`, `Postal Code` → `postal_code`).
-   - Required columns are validated.
-   - Optional fields such as `serial_number` are retained when present.
+### Action-log flow (`pooling_order_action_log.py`)
+This runs **inside `app.py`** — the **Update Action Log** button becomes enabled once a build reaches `ready_for_log`, and clicking it diffs the build's recorded before/after snapshots automatically, with no manual file copying needed.
 
-3. **Database lifecycle**
-   - The app creates or reuses a daily SQLite file (`YYYY-MM-DD-pooling_order.db`).
-   - If today’s DB does not yet exist, the latest DB is copied forward.
-   - Older DB files are moved into `database/previous_versions/`.
-
-4. **Lookup source loading**
-   - **BUDB**: loads from `budb/*.db`, with cache invalidation based on file signature changes.
-   - **PROD**: loads from PROD source data / lookup cache and builds normalized lookup maps.
-   - **Pipedrive**: loads from local Pipedrive cache files and builds normalized lookup maps.
-
-5. **Match refresh for existing database rows**
-   - Existing rows already stored in `pooling_order` are re-checked against the latest BUDB and Pipedrive lookup maps.
-   - Update behavior follows the implemented rules:
-     - blank old → new match = update
-     - old match → different new match = update
-     - old match → no match now = keep old value
-
-6. **New-row matching and enrichment**
-   - Newly imported pooling-order rows are matched independently against BUDB, PROD, and Pipedrive.
-   - Matching outputs populate `budb_id`, `prod_id`, and `deal_id`.
-
-7. **Persistence**
-   - Final enriched rows are inserted into the daily SQLite DB.
-   - Stable row identity is preserved through `po_id`.
-
-
-### B. Standalone Audit / Change-Tracking Workflow
-This workflow is separate from the main importer and is run independently when version-to-version database auditing is needed.
-
-1. **Old/New database selection**
-   - The script reads one database from `old/` and one database from `new/`.
-
-2. **Table resolution**
-   - The comparison targets the `pooling_order` table.
-   - The log destination table is `pooling_order_action_log`.
-
-3. **Historical log carry-forward**
-   - If the old database already contains `pooling_order_action_log`, prior log rows are copied into the new database when the new log table is still empty.
-
-4. **Database comparison**
-   - The script compares old vs. new databases using `po_id` as the primary key.
-   - It detects:
-     - added rows
-     - deleted rows
-     - modified field values
-     - schema changes such as added or removed columns
-
-5. **Log writing**
-   - All detected differences are written into `pooling_order_action_log` inside the new database.
-   - `date_uploaded` is excluded from field-level modification logging.
-
-6. **Audit output**
-   - The result is a versioned action log stored directly in the new PO database for downstream review and traceability.
+1. After **Build DB** completes, click **Update Action Log**. The app calls `compare_databases(old_db_path, new_db_path, build_id)` using the paths recorded by the build, then marks the build `complete`. A `pooling_order_action_log_runs` table (keyed by `build_id`) prevents the same build from being logged twice.
+2. The comparison:
+   - Reads the date from the new DB's filename (expects a `YYYY-MM-DD` pattern, e.g. `2026-11-20-pooling_order.db`).
+   - Creates the `pooling_order_action_log` table inside the new DB if it doesn't already exist.
+   - If the new DB's log table is still empty, copies forward all historical log rows from the old DB's log table first — this is what carries the full change history along as you roll from one daily DB to the next.
+   - Compares the `pooling_order` table between old and new by `po_id`:
+     - Logs any columns added or removed between the two schemas.
+     - Logs any `po_id` present only in the new DB as `added`, and any present only in the old DB as `deleted` (full row snapshot as JSON).
+     - For rows present in both, logs each changed field individually as `modified` (old value → new value). `date_uploaded` is intentionally excluded from field comparison since it changes on every sync.
+3. The resulting `pooling_order_action_log` table — now living inside the new DB file — becomes the historical record going forward.
 
 ### Matching Criteria
 
 #### BUDB matching criteria
-Input key (from pooling order row):
+Input key (from the pooling-order row, tried against both the primary and secondary address fields):
 - `lessor_owner` + `address` + `city` + `state` (normalized)
+- `lessor_owner` + `add_address1` + `add_address1_city` + `add_address1_state` (normalized)
 
 Matched against BUDB combinations:
 1. `Owner` + `Input: Address` + `Input: City` + `Input: State`
@@ -126,60 +105,25 @@ Matched against BUDB combinations:
 4. `Owner` + `md_address` + `md_city` + `md_state`
 
 Post-processing:
-- Direct BUDB ID matches are expanded through `contact_group_id` to include all IDs in the same group.
-
-#### PROD matching criteria
-Input-side combinations (pooling order row):
-1. `lessor_owner` + `address` + `city` + `state`
-2. `first_name + last_name` + `address` + `city` + `state`
-
-Compared against PROD lookup combinations:
-- `combo_full_name`: `first_name + middle_name + last_name` + address + city + state
-- `combo_no_middle`: `first_name + last_name` + address + city + state
-
-Notes:
-- Address is required for match key generation.
-- Output may contain multiple PROD IDs joined by `|`.
+- Direct BUDB ID matches are expanded through `contact_group_id` to include all IDs in the same group, then auto-resolved down to the lowest-numbered group (see **Features** above).
 
 #### Pipedrive matching criteria
 
-Input-side combinations (pooling order row):
+Input-side combinations (pooling-order row):
 
-1. `(lessor_owner)` + `address` + `city` + `state`  
-   compared to **Deal - Contact person + mailing address**
+1. **`po_id`** — compared directly to each deal's **Deal - Pooling Order ID**.
+2. **Serial number** — compared directly to each deal's **Deal - Serial Number**.
+3. `(lessor_owner)` + `address`/`city`/`state` **or** `add_address1`/`add_address1_city`/`add_address1_state`
+   compared to **Deal - Contact person + Person - Mailing Address**.
+4. `(first_name + last_name)` + the same address sets, compared to **Deal - Contact person + Person - Mailing Address**.
+5. **Name found in Deal Title (secondary matching path)** — the system first checks if the **address, city, and state exactly match** the deal's mailing address, then checks if the input name (`lessor_owner` or `first_name + last_name`) is found inside the **Deal - Title**. Only when **both address and name match** is the deal considered a valid match.
 
-2. `(first_name + last_name)` + `address` + `city` + `state`  
-   compared to **Deal - Contact person + mailing address**
-
-3. **Name found in Deal Title (secondary matching path)**  
-   - The system first checks if the **address, city, and state exactly match** the deal’s mailing address  
-   - If the address matches, it then checks if the input name (either `lessor_owner` or `first_name + last_name`) is found inside the **Deal - Title**  
-   - Only when **both address and name match** → the deal is considered a valid match
-
-**How Deal - Title is used**
-
-- The Deal Title usually contains the name of the mineral owner followed by location details  
-  (example: `John Smith Reeves County, TX`)
-
-- The system does **not rely on the title alone**  
-  - It first requires an exact match on the mailing address  
-  - Then uses the title only to confirm that the name is also present
-
-- The tool does not split or analyze the structure of the title  
-  - it simply cleans and standardizes the text  
-  - then checks if the input name appears anywhere in the title
-
-- This serves as a **secondary (fallback) matching method** when the contact person field is incomplete or formatted differently
-
-- This approach ensures that matches are **not based on name alone**, helping prevent incorrect matches between different people with similar names
+Every matched deal ID records which method(s) matched it (`PO ID`, `Serial Number`, `Name + Address`, `Title + Address`), kept in a separate `deal_match_audit` export rather than written to the database.
 
 Notes:
-- Pipedrive source fields required in CSV:
-  - `Deal - ID`
-  - `Deal - Title`
-  - `Deal - Contact person`
-  - `Person - Mailing Address`
-- Output may contain multiple Deal IDs joined by ` | `
+- Pipedrive source fields required in the local cache CSV include `Deal - ID`, `Deal - Title`, `Deal - Contact person`, `Person - Mailing Address`, `Deal - Pooling Order ID`, and `Deal - Serial Number`.
+- Output may contain multiple Deal IDs joined by ` | `.
+- Deals labeled `Test Deal` are excluded from matching.
 
 ### Owner and Address Replacements (Normalization)
 
@@ -217,6 +161,7 @@ Address components are standardized, including:
 - `SUITE` → `STE`
 - `APARTMENT` → `APT`
 - `TRAIL` → `TRL`
+- `FREEWAY` → `FWY`
 - `P.O.` variants → `PO`
 
 Additional cleaning behaviors:
@@ -227,65 +172,185 @@ Additional cleaning behaviors:
 ---
 
 ## 📝 Requirements
-- Python 3.11+ recommended.
-- Local dependencies listed in `requirements.txt`.
-- Access to the following local structure (runtime):
-  - `budb/` folder containing exactly one BUDB `.db` file.
-  - `cache/pipedrive_local_cache.csv` for Pipedrive lookup loading.
-- Network access to PROD MySQL when forcing/rebuilding PROD lookup cache.
+- **Python**: 3.11+ recommended.
+- **Services**:
+  - Google Cloud service account with Sheets (read/write) and Drive (read-only) scopes — required, since the Google Sheet is the only supported import source.
+- **Local reference data** (not included in the repo — must be supplied per environment):
+  - A BUDB SQLite database, selected on the **Bottoms Up** tab at the start of each session (any file location — there is no fixed folder or auto-detection). It must contain a `bottoms_up` table with at least one row and, at minimum, the columns: `id`, `contact_group_id`, `Owner`, `Owner (Standardized)`, `Input: Address`, `Input: City`, `Input: State`, `md_address`, `md_city`, `md_state`.
+  - A Pipedrive deals source at `cache/pipedrive_local_cache.csv`. This is downloaded automatically via the Pipedrive API (see below); there's no supported way to keep it fresh with a manually re-exported file instead.
+  - A Google Sheet whose `po_db` tab includes, at minimum, the headers: `po_id`, `serial_number`, `date_uploaded`.
+- **Python packages**: see `requirements.txt` (UI: `customtkinter`; data: `pandas`, `openpyxl`, `numpy`; Google auth: `google-auth`, `google-api-python-client`; HTTP: `requests`).
 
----
+> Install all pinned dependencies from `requirements.txt`.
 
 ## 🚀 Installation and Setup
-1. Clone the repository.
-2. Create and activate a virtual environment.
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Ensure required folders/files exist:
-   - `budb/<your_budb_file>.db`
-   - `cache/pipedrive_local_cache.csv`
-5. Folder Structure
+1. **Clone repository**
+    ```bash
+    git clone https://github.com/dyoliya/po_db_import_manager.git
+    cd po_db_import_manager
+    ```
 
-      <pre>project/
-      │
-      ├── pooling_order_db_import_manager.py    Main application (GUI) that handles file import, matching, and database updates
-      ├── pooling_order_budb.py                 Handles matching logic and lookup preparation for BUDB data
-      ├── pooling_order_pipedrive.py            Handles matching logic and lookup preparation for Pipedrive data
-      ├── pooling_order_prod.py                 Handles matching logic and lookup preparation for PROD data
-      ├── pooling_order_action_log.py           Standalone tool for comparing old vs new databases and tracking changes
-      │
-      ├── budb/                                 Contains the BUDB source database used for matching
-      ├── cache/                                Stores cached lookup data (e.g., Pipedrive, BUDB) for faster processing
-      │
-      ├── database/                             Local SQLite database storage
-      │   ├── yyyy-mm-dd-pooling_order.db       Active daily database used by the tool
-      │   └── previous_versions/                Archived older database versions for reference
-      │
-      ├── new/                                  Holds the newer database version for comparison (used by action log tool)
-      └── old/                                  Holds the older database version for comparison (used by action log tool)
-      </pre>
-6. Run the app:
-   ```bash
-   python pooling_order_db_import_manager.py
-   ```
+2. **Install dependencies**
+    ```bash
+    pip install -r requirements.txt
+    ```
 
----
+3. **Folder Structure**
+
+    <pre>project/
+    │
+    ├── app.py                          Main application entry point (GUI)
+    ├── po_transform.py                  Column cleaning, phone/date normalization
+    ├── po_sqlite.py                     SQLite schema, po_id/serial allocation, row sync helpers
+    ├── po_deal_id_matcher.py            Row-level Pipedrive deal ID matching (PO ID, serial, name+address, title+address)
+    ├── pooling_order_pipedrive.py       Pipedrive cache loading + lookup maps
+    ├── pipedrive_api.py                 Pipedrive API client + deals download/cache refresh
+    ├── pooling_order_budb.py            Row-level BUDB ID matching + contact-group auto-resolution + cache
+    ├── po_build_state.py                Tracked build lifecycle: prepare/finish/fail-build, pre-build snapshots
+    ├── po_existing_deals_report.py      Associated-deals report generation
+    ├── po_writeback.py                  Google Sheets writeback reconciliation; also the recovery entry point (--apply)
+    ├── pooling_order_action_log.py      Diffs before/after DB snapshots into an action log (run from app.py)
+    ├── initialize_po_baseline.py       Standalone: stamps a known-good, already-tracked DB as the baseline (see Baseline Snapshots & Test Runs)
+    ├── po_run_lock.py                   Exclusive-run lock shared by app.py and the baseline initializer
+    ├── requirements.txt
+    ├── version.txt
+    ├── config/                         Google service account + Pipedrive settings + build-state tracking + run lock (local only)
+    │   ├── google_service_account.json
+    │   ├── pipedrive_settings.json
+    │   ├── build_state.json
+    │   └── po_run.lock
+    ├── cache/                          Local lookup caches + Pipedrive deals CSV (local only)
+    ├── database/                       Final output: the daily PO database(s) (auto-created)
+    │   └── previous_versions/          Pre-build snapshots, archived on every build attempt (and by initialize_po_baseline.py)
+    ├── audit/                          Combined NULL-conversion + BUDB group-selection audit exports (auto-created)
+    ├── existing_deals/                 Deal-match audit + associated-deals reports (auto-created)
+    ├── google_sheet_writeback/         Pending/completed Google writeback records (auto-created)
+    └── input/                          Local backup copies of each downloaded Google Sheet (auto-created)
+        └── google_sheet_backups/       One subfolder per spreadsheet ID, holding timestamped .xlsx + JSON snapshots
+    </pre>
+
+    That's everything needed for normal use — the **Update Action Log** button runs the comparison itself using the build's own recorded snapshots, with no file copying needed.
+
+    Everything under `config/`, `cache/`, `database/`, `audit/`, `existing_deals/`, `google_sheet_writeback/`, and `input/` is environment-specific data and is excluded from version control via `.gitignore`.
+
+4. **Set Up Configuration**
+
+    4.1. **Google Service Account** (required for Google Sheets import)
+    - In Google Cloud Console, create (or reuse) a service account and download its JSON key.
+    - Save it as `config/google_service_account.json`.
+    - Share the target Google Sheet (tab must be named `po_db`) with the service account's `client_email` address.
+    - No further setup is needed — the app reads this file automatically on each Google Sheets import.
+
+    > Skip this step if a service account already exists for this project — just get `config/google_service_account.json` handed over to you and place it in that path.
+
+    4.2. **BUDB Reference Database**
+    - No placement needed — on the **Bottoms Up** tab, click **Browse** and select the current Bottoms Up `.db` file from wherever it's kept.
+    - The app validates it on selection: it must have a `bottoms_up` table with at least one row, and include `id`, `contact_group_id`, `Owner`, `Owner (Standardized)`, `Input: Address`, `Input: City`, `Input: State`, `md_address`, `md_city`, and `md_state` columns.
+    - This selection is **not remembered** between app launches — re-select it (or confirm it's still selected) each session, via **A. First-time preparation** below.
+
+    4.3. **Pipedrive Deals (API download)**
+    - On the app's **Pipedrive** tab, paste in a Pipedrive API token (use the **Open API token page** button to find it in Pipedrive under Settings → API) and click **Save API token**. It's saved to `config/pipedrive_settings.json` so it only needs to be entered once.
+    - There is no manual download button — **Check references** (and, if needed, **Build DB** itself) automatically downloads fresh deals whenever the cache is missing or older than 8 hours (hardcoded, not configurable).
+    - Downloaded deals are written to `cache/pipedrive_local_cache.csv`, so everything downstream (deal matching, the associated-deals report) works the same either way.
+    - A valid token is required to refresh the cache. If the cache file is less than 8 hours old, it's reused without needing a token at all — which is the only way a manually-placed CSV can substitute for the API, and only until it ages out.
+    - `base_url`, `deals_filter_id`, and `deal_custom_field_labels` must also be set in `config/pipedrive_settings.json` for a download to succeed.
+
+5. **Run the app**
+    ```bash
+    python app.py
+    ```
 
 ## 🖥️ User Guide
-1. Open the application.
-2. Select/confirm input pooling-order files.
-3. Start import.
-4. The tool will:
-   - normalize incoming data,
-   - load/update BUDB, PROD, and Pipedrive lookup maps,
-   - match records and populate `budb_id`, `prod_id`, and `deal_id`,
-   - write results to the daily SQLite database.
-5. Use the generated SQLite DB for read-only mineral owner lookup and downstream team workflows.
+
+### A. First-time preparation (repeat each session)
+1. Open the project folder.
+2. Confirm `config/google_service_account.json` exists.
+3. On the **Bottoms Up** tab, click **Browse** and select the current Bottoms Up `.db` file — this is **not** remembered from the last launch, so it must be re-selected every time the app starts.
+4. In the **Pipedrive** tab, confirm an API token is entered and saved (or, if the cache is still less than 8 hours old, confirm `cache/pipedrive_local_cache.csv` exists and is reasonably up to date).
+
+### B. Import PO records
+1. Launch the app (`python app.py`, or the compiled executable).
+2. On the **Pipedrive** tab, paste your API token and click **Save API token** (skip if already saved from a previous session).
+3. On the **Bottoms Up** tab, click **Browse** and select the current Bottoms Up `.db` file — this isn't remembered between launches, so it's needed every session.
+4. Paste the Google Sheet URL into the **Google Sheets URL** field (its `po_db` tab will be read).
+5. Click **Check references** — confirms the sheet is reachable, editable, and correctly formatted, the Pipedrive API token is valid, the BUDB file is valid, and local storage is ready. This must succeed before **Build DB** is enabled.
+6. Click **Build DB**.
+7. Watch the **Activity Log** for progress: cleaning, Pipedrive matching, BUDB matching, county enrichment, row sync, and Google writeback.
+8. On completion, a dialog confirms the build and the action log has already been updated as part of the same run — if the action log step itself fails, keep the updated database and click **Update Action Log** to retry.
+
+### C. Review outputs
+- **The final output is the daily database itself**: `database/YYYY-MM-DD-pooling_order.db` — this is what the whole build updates.
+- Check `audit/` for the combined NULL-conversion / BUDB group-selection audit workbook if the log reported suspicious conversions or multi-group BUDB matches.
+- Check `existing_deals/` for the deal-match audit and the PO-associated-deals report generated after every import.
+- Check the Activity Log for the Google Sheets writeback confirmation and record path under `google_sheet_writeback/`.
+
+### D. Review the change log (`pooling_order_action_log.py`)
+After a build completes (step B.8 above), review the logged entries in the `pooling_order_action_log` table of the database in `database/` — check that the added/deleted/modified rows make sense for that version.
+- **If everything looks correct**: nothing further to do — that build is `complete` and is the official daily version.
+- **If something looks wrong**: coordinate on the flagged log entries to correct the input (Google Sheet) data, then:
+  1. Restore the pre-build snapshot from `database/previous_versions/` back into `database/`.
+  2. Re-run the import in `app.py` against the corrected input to rebuild a new version of the database.
+  3. Review the action log again for this rebuilt version before treating it as final.
+
+### E. Important usage notes
+- Each calendar day gets its own database file; re-running on the same day continues syncing into that day's file rather than creating a new one.
+- Every click of **Build DB** archives a pre-build snapshot into `database/previous_versions/<build_id>/` first, and a failed build is automatically rolled back to that snapshot (unless a Google writeback had already started — see Troubleshooting).
+- The **Build DB** button is disabled unless the previous build finished (`complete` or `rolled_back`); an unfinished or `recovery_required` build must be resolved first.
+- If a Google Sheets writeback is interrupted, a pending record remains in `google_sheet_writeback/` and must be resolved before the next Google Sheets import can run.
+- `pooling_order_action_log.py` runs automatically from `app.py` once a build finishes — see **D** above.
+- Only one of `app.py` or `initialize_po_baseline.py` can run against this project folder at a time — a second one will report that another process is running (`po_run_lock.py`).
+
+### F. Baseline snapshots & test runs (`initialize_po_baseline.py`)
+`initialize_po_baseline.py` is a **separate, manually-run script** (not launched from `app.py`). It stamps a known-good `database/*.db` file as the officially tracked baseline and records a safety-net backup of it, so you have a confirmed-stable snapshot to fall back on — most useful right before doing a test/experimental run you might want to discard.
+
+Unlike a fresh/empty database, the file you point this at must already be a real, previously-tracked PO database: it must contain a populated `pooling_order` table with its complete `pooling_order_action_log` history, and must not already carry build-state tracking.
+
+1. **Prepare the stable database**: make sure the verified `YYYY-MM-DD-pooling_order.db` file you want to treat as "stable" is the **only** `.db` file sitting directly inside `database/` (move anything else out first).
+2. **Run it**:
+   ```bash
+   python initialize_po_baseline.py
+   ```
+3. The script:
+   - Verifies that file is the only `.db` in `database/`, matches the `YYYY-MM-DD-pooling_order.db` naming pattern, and does **not** already carry build-state tracking (`pooling_order_build_state` table or `config/build_state.json`) — it refuses to run otherwise, so it never silently overwrites existing tracking.
+   - Verifies it contains both the `pooling_order` table and its `pooling_order_action_log` history, and that the file passes SQLite's `quick_check`.
+   - Verifies no pending Google writeback files exist in `google_sheet_writeback/`.
+   - Copies the database, as-is, into `database/previous_versions/baseline-<id>/` — this is your restore point.
+   - Stamps the live database (and `config/build_state.json`) with a fresh `baseline-<id>` build, status `complete`, so the app's **Build DB** button is immediately usable again.
+4. You can now do your test run(s) through the app as usual. Each build attempt still creates its own `previous_versions/<build_id>/` snapshot automatically, and a failed build auto-restores on its own.
+5. **To throw away a test run and go back to the stable baseline**: close the app, replace the file in `database/` with the copy saved in `database/previous_versions/baseline-<id>/`, delete `config/build_state.json`, and re-run `initialize_po_baseline.py` to re-stamp it as a clean, trackable baseline before resuming normal use.
+
+### G. Recovering an interrupted writeback (`po_writeback.py`)
+If the app was closed or crashed after a Google writeback may have started (build status `recovery_required`), run this script **before** touching the database or the Sheet further:
+```bash
+python po_writeback.py --apply
+```
+- It loads the pending writeback's journaled row mapping, re-downloads the live Sheet, and confirms every cell it needs to write (or already wrote) hasn't been changed by anyone else since the original capture.
+- If nothing conflicts, it replays or confirms the writeback, archives the pending record, and marks the build `complete` — open the app afterward and confirm the action log is up to date.
+- If the sheet changed in a conflicting way, it stops and leaves the build as `recovery_required` for manual review of that specific cell.
+
+### H. Common troubleshooting
+- **"Pipedrive local cache CSV not found"**: `cache/pipedrive_local_cache.csv` is missing. Click **Check references** with a valid API token entered on the **Pipedrive** tab to download it.
+- **"Enter and save your Pipedrive API token; a fresh download is required."**: The cache is gone or older than 8 hours and no token is saved. Enter a token on the **Pipedrive** tab and click **Save API token**, then **Check references**.
+- **"Cannot write to the Pipedrive cache CSV or its folder."**: Close `cache/pipedrive_local_cache.csv` if it's open in Excel or elsewhere, and confirm you have write permission to the `cache/` folder.
+- **Pipedrive download errors (bad token, rate limited, field not found, etc.)**: The error message in the Activity Log / popup names the specific problem (e.g. an unexpected or renamed Pipedrive field) — check `config/pipedrive_settings.json`'s `deal_custom_field_labels` against the actual field names in Pipedrive if a field-not-found error appears.
+- **"Select a Bottoms Up .db file first." / "Select an existing .db file."**: Click **Browse** on the **Bottoms Up** tab and select the current Bottoms Up `.db` file — this isn't remembered between app launches.
+- **"This file has no bottoms_up table." / "BUDB is missing required columns: ..." / "The bottoms_up table contains no records."**: The selected file isn't a valid BUDB export — confirm it has a populated `bottoms_up` table with the required columns listed under **Requirements** above.
+- **"Missing required Sheet headers: ..."**: The `po_db` tab is missing one of `po_id`, `serial_number`, or `date_uploaded` — correct the header row before building.
+- **"Unexpected range-ID column header(s): ..."**: A column header pulled through as an internal Google Sheets range name instead of real text — rename that column's header in row 1.
+- **"An unresolved Google writeback exists" / "A previous Google writeback needs recovery."**: Resolve the pending file in `google_sheet_writeback/` before starting another Google Sheets import, or run `po_writeback.py --apply` (see **G** above).
+- **"Sheet values changed during capture." / "The sheet changed during checking."**: Re-run the import or check after editing of the sheet has stopped.
+- **"Expected one initialized PO baseline." / "Found N .db files in database/."**: Only one active PO database is allowed directly inside `database/` — resolve the extra files (or run `initialize_po_baseline.py` if none exists yet).
+- **"The previous build is not finished."**: A prior build is stuck at `building`, `ready_for_log`, or `recovery_required`. Finish it (click **Update Action Log**) or resolve its recovery state before clicking **Build DB** again.
+- **"Recovery required" / "Build tracking disagrees; recovery required." / "Recorded build database is missing; recovery required."**: `config/build_state.json` and the database's own tracking no longer agree (e.g. a `.db` file was moved or replaced by hand). Inspect `database/`, `config/build_state.json`, and the relevant `previous_versions/` snapshot before deleting anything.
+- **"Database preserved. Google writeback may have occurred; recovery is required."**: A build failed *after* the Google Sheets writeback had already started, so the sheet may be partially updated. Run `python po_writeback.py --apply` to validate and safely resume or confirm the writeback.
+- **"Another PO app, initializer, or recovery process is running."**: Close whichever of `app.py` or `initialize_po_baseline.py` is already running against this project folder, then retry.
+- **(From `initialize_po_baseline.py`) "Place exactly one YYYY-MM-DD-pooling_order.db baseline directly in database/."**: Remove any other `.db` files from `database/` so only the intended baseline file remains.
+- **(From `initialize_po_baseline.py`) "Build tracking already exists" / "Database already has build tracking; restore its state instead."**: The target database is already tracked — inspect its current state with the app instead of re-initializing it.
+- **(From `initialize_po_baseline.py`) "Baseline must contain pooling_order and its pooling_order_action_log history." / "SQLite quick_check failed."**: The file isn't a valid, previously-tracked PO database — point the script at a real exported/verified PO database, not a blank or partial one.
+- **(From `initialize_po_baseline.py`) "Unresolved Google writeback exists; do not initialize."**: Resolve the pending file(s) in `google_sheet_writeback/` before initializing a baseline.
 
 ---
 
 ## 👩‍💻 Credits
-- **2026-04-08**: Project created by **Julia** ([@dyoliya](https://github.com/dyoliya))  
+- **2026-04-08**: Project created by **Julia** ([@dyoliya](https://github.com/dyoliya))
 - 2026–present: Maintained by **Julia** for **Community Minerals II, LLC**
