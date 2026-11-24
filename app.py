@@ -27,7 +27,7 @@ import uuid
 from tkinter import filedialog
 
 from po_transform import clean_and_prepare_df, sanitize_colname
-from po_sqlite import SYSTEM, DERIVED, PROTECTED, allocate, synchronize, combined_counties, validate_po_baseline
+from po_sqlite import SYSTEM, DERIVED, PROTECTED, allocate, synchronize, append_new_rows, combined_counties, validate_po_baseline
 from po_deal_id_matcher import populate_po_deal_ids_in_df
 from pooling_order_budb import (
     load_budb_lookup_maps,
@@ -36,6 +36,17 @@ from pooling_order_budb import (
     connect_sqlite_readonly,
 )
 from po_existing_deals_report import generate_po_associated_deals_report
+from po_local_source import (
+    discover_input_files,
+    prepare_local_file,
+    preview_file_rows,
+    find_blank_required_values,
+    backfill_decd_source,
+    drop_duplicate_rows,
+    summarize_file_results,
+    refresh_derived_columns,
+    ALLOWED_NEW_COLUMNS,
+)
 
 from datetime import datetime
 from datetime import date
@@ -680,6 +691,7 @@ class POImporterApp(ctk.CTk):
         self.references_ready = False
         self.ui_events = queue.Queue()
         self.reference_labels = {}
+        self._reference_display = {}
 
         # --- Signature UI colors (your theme) ---
         self.PANEL_BG = "#273946"
@@ -688,8 +700,8 @@ class POImporterApp(ctk.CTk):
         self.ACCENT_HOVER = "#ffab4c"
         self.TEXT_DARK = "#273946"
 
-        self.title("PO DB Builder [v2.0.0]")
-        default_width, default_height = 760, 500
+        self.title("PO DB Builder [v2.1.0]")
+        default_width, default_height = 760, 610
         width = min(default_width, self.winfo_screenwidth() - 40)
         height = min(default_height, self.winfo_screenheight() - 80)
         self.geometry(f"{width}x{height}")
@@ -1018,9 +1030,37 @@ class POImporterApp(ctk.CTk):
     def _setup_import_tab(self, tab):
         self.input_source = ctk.StringVar(value="Google Sheets")
         self.google_sheet_url = ctk.StringVar(value="")
+        self.local_input_paths = []
+        self.local_files_summary_var = ctk.StringVar(value="No files selected")
+
+        source_row = ctk.CTkFrame(tab, fg_color="transparent")
+        source_row.pack(fill="x", padx=10, pady=(6, 4))
+
+        ctk.CTkRadioButton(
+            source_row,
+            text="Google Sheets",
+            variable=self.input_source,
+            value="Google Sheets",
+            command=self._on_input_source_change,
+            font=("Segoe UI", 12),
+            text_color=self.APP_BG,
+        ).pack(side="left", padx=(0, 16))
+
+        ctk.CTkRadioButton(
+            source_row,
+            text="Local Files",
+            variable=self.input_source,
+            value="Local Files",
+            command=self._on_input_source_change,
+            font=("Segoe UI", 12),
+            text_color=self.APP_BG,
+        ).pack(side="left")
+
+        # ---------- Google Sheets panel ----------
+        self.google_panel = ctk.CTkFrame(tab, fg_color="transparent")
 
         ctk.CTkLabel(
-            tab,
+            self.google_panel,
             text="Google Sheets URL",
             height=20,
             font=("Segoe UI", 12),
@@ -1033,7 +1073,7 @@ class POImporterApp(ctk.CTk):
         )
 
         self.google_url_entry = ctk.CTkEntry(
-            tab,
+            self.google_panel,
             textvariable=self.google_sheet_url,
             placeholder_text="Paste Google Sheets URL here",
             height=30,
@@ -1046,7 +1086,7 @@ class POImporterApp(ctk.CTk):
         )
 
         ctk.CTkLabel(
-            tab,
+            self.google_panel,
             text="Source tab: po_db",
             height=20,
             font=("Segoe UI", 11),
@@ -1057,6 +1097,178 @@ class POImporterApp(ctk.CTk):
             padx=10,
             pady=(0, 12),
         )
+
+        # ---------- Local Files panel ----------
+        self.local_panel = ctk.CTkFrame(tab, fg_color="transparent")
+
+        ctk.CTkLabel(
+            self.local_panel,
+            text="Local CSV/XLSX file(s)",
+            height=20,
+            font=("Segoe UI", 12),
+            text_color=self.APP_BG,
+            anchor="w",
+        ).pack(
+            fill="x",
+            padx=10,
+            pady=(6, 4),
+        )
+
+        local_btn_row = ctk.CTkFrame(self.local_panel, fg_color="transparent")
+        local_btn_row.pack(fill="x", padx=10, pady=(0, 4))
+
+        self.browse_local_files_btn = ctk.CTkButton(
+            local_btn_row,
+            text="Browse files...",
+            command=self._browse_local_files,
+            height=30,
+            font=("Segoe UI", 11),
+            fg_color=self.ACCENT,
+            hover_color=self.ACCENT_HOVER,
+        )
+        self.browse_local_files_btn.pack(side="left", padx=(0, 6))
+
+        self.browse_local_folder_btn = ctk.CTkButton(
+            local_btn_row,
+            text="Browse folder...",
+            command=self._browse_local_folder,
+            height=30,
+            font=("Segoe UI", 11),
+            fg_color=self.ACCENT,
+            hover_color=self.ACCENT_HOVER,
+        )
+        self.browse_local_folder_btn.pack(side="left")
+
+        self.local_files_info_label = ctk.CTkLabel(
+            self.local_panel,
+            textvariable=self.local_files_summary_var,
+            font=("Segoe UI", 10),
+            text_color="#c5cfd5",
+            anchor="w",
+            height=18,
+        )
+        self.local_files_info_label.pack(
+            fill="x",
+            padx=10,
+            pady=(0, 12),
+        )
+
+        self._apply_source_widget_states()
+
+
+    def _on_input_source_change(self):
+        # Selecting a source clears the other source's data so a build
+        # never mixes a Google Sheet with local files.
+        if self.input_source.get() == "Google Sheets":
+            self.local_input_paths = []
+            self.local_files_summary_var.set("No files selected")
+        else:
+            self.google_sheet_url.set("")
+
+        self._apply_source_widget_states()
+        self._invalidate_references()
+
+
+    def _apply_source_widget_states(self):
+        is_google = self.input_source.get() == "Google Sheets"
+
+        if is_google:
+            self.local_panel.pack_forget()
+            self.google_panel.pack(fill="x", pady=(0, 6))
+        else:
+            self.google_panel.pack_forget()
+            self.local_panel.pack(fill="x", pady=(0, 6))
+
+        google_state = "normal" if (is_google and not self.busy) else "disabled"
+        local_state = "normal" if (not is_google and not self.busy) else "disabled"
+
+        self.google_url_entry.configure(state=google_state)
+        self.browse_local_files_btn.configure(state=local_state)
+        self.browse_local_folder_btn.configure(state=local_state)
+
+        self._reference_display["Google Sheets"] = (
+            "Google Sheets" if is_google else "Local Files"
+        )
+
+
+    def _browse_local_files(self):
+        if self.busy:
+            return
+
+        selected = filedialog.askopenfilenames(
+            parent=self,
+            title="Select local PO files",
+            filetypes=[("CSV/Excel files", "*.csv *.xlsx *.xls")],
+        )
+
+        if not selected:
+            return
+
+        self._set_local_input_paths(list(selected))
+
+
+    def _browse_local_folder(self):
+        if self.busy:
+            return
+
+        selected = filedialog.askdirectory(
+            parent=self,
+            title="Select a folder of local PO files",
+        )
+
+        if not selected:
+            return
+
+        self._set_local_input_paths([selected])
+
+
+    def _set_local_input_paths(self, paths):
+        try:
+            files = discover_input_files(paths)
+        except Exception as exc:
+            messagebox.showerror("Invalid selection", str(exc))
+            return
+
+        if not files:
+            messagebox.showerror(
+                "No files found",
+                "No .csv/.xlsx files were found in that selection.",
+            )
+            return
+
+        self.local_input_paths = [str(p) for p in files]
+        self.local_files_summary_var.set(f"{len(files)} file(s) selected")
+        self._log(f"[LOCAL] Selected {len(files)} file(s):")
+        for path in files:
+            self._log(f"[LOCAL]   {path}")
+        self._invalidate_references()
+
+
+    def _apply_checked_local_files(self, files):
+        """Called from Check references (local source) to narrow the build's
+        file list down to whatever survived the already-imported/duplicate
+        checks in check_local_files()."""
+        self.local_input_paths = [str(p) for p in files]
+        self.local_files_summary_var.set(f"{len(files)} file(s) ready to build")
+
+
+    def _ask_yes_no_threadsafe(self, title, message):
+        """Show a Yes/No dialog from a background thread and block until answered.
+
+        Tkinter dialogs must run on the main thread; this hands the prompt to
+        the UI event queue (processed by _poll_ui) and waits on an Event for
+        the main thread to record the answer.
+        """
+        result = {}
+        done = threading.Event()
+
+        def ask():
+            result["value"] = messagebox.askyesno(title, message)
+            done.set()
+
+        self._call_ui(ask)
+        done.wait()
+        return result.get("value", False)
 
 
     def _browse_budb(self):
@@ -1135,8 +1347,17 @@ class POImporterApp(ctk.CTk):
         if self.busy or not self.references_ready:
             return
 
+        is_google = self.input_source.get() == "Google Sheets"
         url = self.google_sheet_url.get().strip()
+        input_paths = list(self.local_input_paths)
         budb_path = self.budb_path_var.get().strip()
+
+        if not is_google and not input_paths:
+            messagebox.showwarning(
+                "No files selected",
+                "Browse a file or folder before building from Local Files.",
+            )
+            return
 
         self._set_busy(True)
         self.references_ready = False
@@ -1154,10 +1375,15 @@ class POImporterApp(ctk.CTk):
                         raise RuntimeError("Expected one initialized PO baseline.")
                     validate_po_baseline(active[0])
 
+                    pending_path = (
+                        google_pending_path(url) if is_google
+                        else base / "google_sheet_writeback" / "_local_build_pending.json"
+                    )
+
                     build = prepare_build(
                         base,
                         datetime.now(CENTRAL_TZ).strftime("%Y-%m-%d"),
-                        google_pending_path(url),
+                        pending_path,
                     )
 
                     self._log(
@@ -1170,9 +1396,9 @@ class POImporterApp(ctk.CTk):
 
                     self._import_worker(
                         build["new_db"],
-                        [url],
+                        [url] if is_google else input_paths,
                         "pooling_order",
-                        "Google Sheets",
+                        "Google Sheets" if is_google else "Local Files",
                         budb_path=selected_budb,
                     )
 
@@ -1458,8 +1684,9 @@ class POImporterApp(ctk.CTk):
             "Error": self.ACCENT,
         }
 
+        display = self._reference_display.get(key, key)
         self.reference_labels[key].configure(
-            text=f"{key}   ·   {state}",
+            text=f"{display}   ·   {state}",
             image=self.status_icons[state],
             text_color=colors[state],
         )
@@ -1478,12 +1705,13 @@ class POImporterApp(ctk.CTk):
 
         for widget in (
             self.check_btn,
-            self.google_url_entry,
             self.pipedrive_token_entry,
             self.save_pipedrive_btn,
             self.browse_budb_btn,
         ):
             widget.configure(state=state)
+
+        self._apply_source_widget_states()
 
         self.import_btn.configure(
             state=(
@@ -1516,11 +1744,16 @@ class POImporterApp(ctk.CTk):
             return
 
         self._invalidate_references()
+        is_google = self.input_source.get() == "Google Sheets"
         url = self.google_sheet_url.get().strip()
+        input_paths = list(self.local_input_paths)
         budb_path = self.budb_path_var.get().strip()
 
         try:
-            extract_google_sheet_id(url)
+            if is_google:
+                extract_google_sheet_id(url)
+            elif not input_paths:
+                raise ValueError("Browse a file or folder before checking references.")
 
             settings = self._load_pipedrive_settings_safe()
 
@@ -1546,12 +1779,12 @@ class POImporterApp(ctk.CTk):
 
         threading.Thread(
             target=self._check_worker,
-            args=(url, budb_path),
+            args=(is_google, url, input_paths, budb_path),
             daemon=True,
         ).start()
 
 
-    def _check_worker(self, url, budb_path):
+    def _check_worker(self, is_google, url, input_paths, budb_path):
         base = get_app_base_dir()
 
         def check_sheet():
@@ -1604,6 +1837,101 @@ class POImporterApp(ctk.CTk):
                 raise RuntimeError(
                     "The sheet changed during checking. Check again."
                 )
+
+        def check_local_files():
+            files = discover_input_files(input_paths)
+            if not files:
+                raise RuntimeError("No .csv/.xlsx files found in the selected input.")
+
+            db_files = sorted((base / "database").glob("*.db"))
+            if len(db_files) != 1:
+                raise RuntimeError("Expected one initialized PO baseline in database/.")
+
+            accepted_files = []
+            removed_files = []
+
+            with sqlite3.connect(
+                db_files[0].resolve().as_uri() + "?mode=ro", uri=True,
+            ) as ro_conn:
+                existing_filenames = {
+                    row[0] for row in ro_conn.execute(
+                        "SELECT DISTINCT source_url FROM pooling_order "
+                        "WHERE source_url IS NOT NULL"
+                    )
+                }
+
+                for path in files:
+                    cleaned, tracking = preview_file_rows(path)
+                    if cleaned.empty:
+                        raise ValueError(f"{path.name}: no data rows.")
+
+                    blank_hits = find_blank_required_values(cleaned, tracking)
+                    if not blank_hits.empty:
+                        bad_columns = sorted(blank_hits["column"].unique())
+                        bad_rows = sorted(blank_hits["row_in_file"].unique().tolist())
+                        preview_rows = ", ".join(str(r) for r in bad_rows[:10])
+                        if len(bad_rows) > 10:
+                            preview_rows += f", +{len(bad_rows) - 10} more"
+
+                        self._log(
+                            f"[LOCAL] Skipped: {path.name} (blank "
+                            f"{', '.join(bad_columns)} in {len(bad_rows)} "
+                            f"row(s): {preview_rows})."
+                        )
+                        self._call_ui(lambda p=path.name, cols=bad_columns, rows=preview_rows:
+                            messagebox.showwarning(
+                                "Blank required values",
+                                f"'{p}' has blank/NULL {', '.join(cols)} in "
+                                f"row(s): {rows}.\n\n"
+                                "This file was skipped. Fix it and re-select it.",
+                            )
+                        )
+                        removed_files.append(path.name)
+                        continue
+
+                    if path.name in existing_filenames:
+                        proceed = self._ask_yes_no_threadsafe(
+                            "File already imported",
+                            f"'{path.name}' already appears in the database "
+                            "(matched by filename).\n\n"
+                            "Continue checking it for any new rows anyway?",
+                        )
+
+                        if not proceed:
+                            self._log(
+                                f"[LOCAL] Skipped by user: {path.name} "
+                                "(already imported)."
+                            )
+                            removed_files.append(path.name)
+                            continue
+
+                        keep_mask, _skipped = drop_duplicate_rows(
+                            ro_conn, cleaned, tracking,
+                        )
+
+                        if not keep_mask.any():
+                            self._log(
+                                f"[LOCAL] Skipped: {path.name} "
+                                "(every row already exists in the database)."
+                            )
+                            removed_files.append(path.name)
+                            continue
+
+                    accepted_files.append(path)
+
+            if not accepted_files:
+                raise RuntimeError(
+                    "No files remain after duplicate checks: "
+                    + ", ".join(removed_files)
+                )
+
+            self._call_ui(
+                lambda paths=accepted_files: self._apply_checked_local_files(paths)
+            )
+            self._log(
+                f"[LOCAL] Validated {len(accepted_files)} of {len(files)} "
+                "selected file(s)."
+            )
 
         def check_pipedrive():
             ensure_fresh_pipedrive_cache(base, log=self._log)
@@ -1723,12 +2051,13 @@ class POImporterApp(ctk.CTk):
             )
 
         failures = []
+        source_check_label = "Google Sheets" if is_google else "Local Files"
 
-        for key, check in (
-            ("Pipedrive", check_pipedrive),
-            ("BUDB", check_budb),
-            ("Google Sheets", check_sheet),
-            ("Local storage", check_local_storage),
+        for key, label, check in (
+            ("Pipedrive", "Pipedrive", check_pipedrive),
+            ("BUDB", "BUDB", check_budb),
+            ("Google Sheets", source_check_label, check_sheet if is_google else check_local_files),
+            ("Local storage", "Local storage", check_local_storage),
         ):
             self._call_ui(lambda k=key: self._set_reference(k, "Checking..."),
             )
@@ -1738,15 +2067,15 @@ class POImporterApp(ctk.CTk):
 
             except Exception as exc:
                 error_text = str(exc)
-                failures.append((key, error_text))
+                failures.append((label, error_text))
 
-                self._log(f"[ERROR] {key}: {error_text}")
+                self._log(f"[ERROR] {label}: {error_text}")
 
                 self._call_ui(lambda k=key: self._set_reference(k, "Error"),
                 )
 
             else:
-                self._log(f"[READY] {key}")
+                self._log(f"[READY] {label}")
 
                 self._call_ui(lambda k=key: self._set_reference(k, "Ready"),
                 )
@@ -1981,9 +2310,20 @@ class POImporterApp(ctk.CTk):
 
 
     def _import_worker(self, db_path, input_paths, table, input_source="Google Sheets", *, budb_path):
-        if input_source != "Google Sheets" or len(input_paths) != 1 or table != "pooling_order":
-            raise ValueError("Build expects one authoritative PO Google Sheet.")
-        url = input_paths[0]
+        if table != "pooling_order" or not input_paths:
+            raise ValueError("Build expects a pooling_order source.")
+
+        if input_source == "Google Sheets":
+            if len(input_paths) != 1:
+                raise ValueError("Build expects one authoritative PO Google Sheet.")
+            self._import_worker_google(db_path, input_paths[0], table, budb_path=budb_path)
+        elif input_source == "Local Files":
+            self._import_worker_local(db_path, input_paths, table, budb_path=budb_path)
+        else:
+            raise ValueError(f"Unknown input source: {input_source!r}")
+
+
+    def _import_worker_google(self, db_path, url, table, *, budb_path):
         base = get_app_base_dir()
         conn = None
         try:
@@ -2122,6 +2462,167 @@ class POImporterApp(ctk.CTk):
             if conn is not None:
                 conn.close()
 
+
+    def _import_worker_local(self, db_path, input_paths, table, *, budb_path):
+        base = get_app_base_dir()
+        conn = None
+        try:
+            pipedrive_result = ensure_fresh_pipedrive_cache(
+                base, log=self._log, progress=self.progress_callback,
+            )
+            if pipedrive_result.get("downloaded"):
+                self._log("[PIPEDRIVE] Fresh deals downloaded from Pipedrive.")
+            self._call_ui(self._refresh_pipedrive_status)
+
+            selected = validate_budb_file(budb_path)
+            maps, meta = load_budb_lookup_maps(base, budb_path=selected)
+
+            files = discover_input_files(input_paths)
+            if not files:
+                raise ValueError("No .csv/.xlsx files found in the selected input.")
+
+            self._log(f"[LOCAL] Reading {len(files)} file(s)...")
+            frames, trackings = [], []
+            for path in files:
+                self.progress_callback(0, f"[LOCAL] Reading: {path.name}")
+                frame, tracking = prepare_local_file(path)
+                frames.append(frame)
+                trackings.append(tracking)
+
+            combined = pd.concat(frames, ignore_index=True)
+            tracking_all = pd.concat(trackings, ignore_index=True)
+            combined.insert(0, "po_id", "")
+
+            self.progress_callback(0, "[LOCAL] Cleaning/standardizing...")
+            df, originals, sanitized, phones, dates, null_audit = clean_and_prepare_df(combined)
+            df = backfill_decd_source(df)
+
+            if not null_audit.empty:
+                null_audit = null_audit.copy()
+                ref_idx = (null_audit["row_index"] - 2).to_numpy()
+                null_audit["source_file"] = tracking_all.iloc[ref_idx]["source_file"].values
+                null_audit["row_in_file"] = tracking_all.iloc[ref_idx]["row_in_file"].values
+
+            conn = sqlite3.connect(db_path)
+            conn.execute("BEGIN IMMEDIATE")
+
+            self.progress_callback(0, "[LOCAL] Checking for duplicate rows...")
+            keep_mask, skipped_df = drop_duplicate_rows(conn, df, tracking_all)
+            file_summary = summarize_file_results(tracking_all, keep_mask)
+
+            kept_count = int(keep_mask.sum())
+            skipped_count = int((~keep_mask).sum())
+            self._log(
+                f"[LOCAL] Rows read: {len(df):,} | Kept: {kept_count:,} | "
+                f"Skipped as duplicates: {skipped_count:,}"
+            )
+            for _, row in file_summary.iterrows():
+                self._log(
+                    f"[LOCAL]   {row['source_file']}: read {row['rows_read']:,}, "
+                    f"kept {row['rows_kept']:,}, skipped {row['rows_skipped']:,}"
+                )
+
+            df = df.loc[keep_mask].reset_index(drop=True)
+            kept_tracking = tracking_all.loc[keep_mask].reset_index(drop=True)
+
+            if df.empty:
+                raise ValueError(
+                    "No importable rows: every row was a duplicate of an "
+                    "existing pooling_order row or another selected file."
+                )
+
+            df["source_url"] = kept_tracking["source_file"]
+
+            self.progress_callback(0, "[LOCAL] Allocating PO IDs...")
+            df, stored, columns = allocate(conn, df, CENTRAL_TZ)
+
+            for col in DERIVED:
+                if col not in df.columns:
+                    df[col] = None
+
+            writable = set(df.columns) - SYSTEM
+            existing_writable = writable & set(columns)
+            allowed_new = (writable - existing_writable) & ALLOWED_NEW_COLUMNS
+            final_writable = existing_writable | allowed_new
+            unrecognized = sorted(writable - final_writable)
+            if unrecognized:
+                self._log(
+                    "[LOCAL] Ignoring column(s) not already in the pooling_order "
+                    f"table (no new columns are added from local files): {', '.join(unrecognized)}"
+                )
+            if allowed_new:
+                self._log(
+                    "[LOCAL] Adding recognized new column(s) to pooling_order: "
+                    f"{', '.join(sorted(allowed_new))}"
+                )
+
+            inserted = append_new_rows(conn, df, columns, final_writable)
+            conn.commit()
+            self._log(f"[LOCAL] Inserted {inserted:,} new row(s).")
+
+            self.progress_callback(0, "[LOCAL] Refreshing derived IDs across the full database...")
+            refresh_result = refresh_derived_columns(
+                conn, maps, base, progress_callback=self.progress_callback,
+            )
+            conn.commit()
+            self._log(
+                "[LOCAL] Full-table derived-column refresh: "
+                f"{refresh_result['rows_changed']:,}/{refresh_result['rows_considered']:,} "
+                "row(s) changed (deal_id/budb_id/contact_group_id/combined_counties)."
+            )
+
+            build = read_state(base)
+            run_id = build["build_id"]
+
+            audit_folder = base / "audit"
+            audit_folder.mkdir(parents=True, exist_ok=True)
+
+            group_audit = refresh_result["group_audit"]
+            deal_audit = refresh_result["deal_audit"]
+
+            if not null_audit.empty or not skipped_df.empty or not group_audit.empty:
+                audit_path = audit_folder / f"po_local_audit_{run_id}.xlsx"
+                with pd.ExcelWriter(audit_path, engine="openpyxl") as writer:
+                    for name, data in (
+                        ("null_conversions", null_audit),
+                        ("skipped_rows", skipped_df),
+                        ("file_summary", file_summary),
+                        ("budb_group_selection", group_audit),
+                    ):
+                        if not data.empty:
+                            data.to_excel(writer, sheet_name=name, index=False)
+                self._log(f"[AUDIT] Saved local-import audit: {audit_path}")
+            else:
+                self._log(
+                    "[AUDIT] No suspicious NULL conversions, skipped duplicates, "
+                    "or multiple BUDB contact groups detected."
+                )
+
+            self.progress_callback(
+                0, "[REPORT] Generating PO associated deals report...",
+            )
+            report = generate_po_associated_deals_report(db_path=db_path, base_dir=base, table=table)
+            report_dir = base / "existing_deals"
+            if deal_audit is not None and not deal_audit.empty:
+                match_path = report_dir / f"po_local_deal_match_audit_{run_id}.xlsx"
+                deal_audit.to_excel(match_path, sheet_name="deal_match_audit", index=False)
+                self._log(f"[AUDIT] Saved deal match audit: {match_path}")
+            self._log(
+                f"[REPORT] Saved associated deals report: {report['output_path']}\n"
+                f"[REPORT] Exported rows: {report['rows_exported']:,} | "
+                f"PO rows with deal_id: {report['unique_po_rows']:,}"
+            )
+
+            self._log(
+                f"[SYNC] Inserted: {inserted:,} | Skipped (duplicates): {skipped_count:,}"
+            )
+        except Exception:
+            if conn is not None:
+                conn.rollback()
+            raise
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 if __name__ == "__main__":

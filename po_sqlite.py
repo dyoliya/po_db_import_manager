@@ -142,6 +142,34 @@ def synchronize(conn, df, stored, columns, sheet_business):
     return result
 
 
+def append_new_rows(conn, df, columns, writable):
+    """Insert every row in `df` as a brand-new pooling_order row.
+
+    Unlike synchronize(), this never updates or deletes existing rows — it is
+    only safe to call with a dataframe whose po_id values were all freshly
+    allocated (see allocate()), e.g. local-file imports.
+    """
+    if df.empty:
+        return 0
+
+    writable = sorted(writable)
+    for col in writable:
+        if col not in columns:
+            conn.execute(f"ALTER TABLE pooling_order ADD COLUMN {quote(col)} TEXT")
+
+    fields = sorted(SYSTEM) + writable
+    omitted = [c for c in columns if c not in fields]
+    names = ",".join(map(quote, fields + omitted))
+    marks = ",".join(["?"] * len(fields) + ["NULL"] * len(omitted))
+
+    rows = (
+        tuple(None if pd.isna(v) else str(v) for v in values)
+        for values in df[fields].itertuples(index=False, name=None)
+    )
+    conn.executemany(f"INSERT INTO pooling_order ({names}) VALUES ({marks})", rows)
+    return len(df)
+
+
 def combined_counties(county, state):
     if pd.isna(county) or pd.isna(state):
         return None

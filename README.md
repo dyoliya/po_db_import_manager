@@ -3,11 +3,11 @@
 **PO DB Builder** is a desktop utility (built with Python) that implements a
 **controlled Extract–Transform–Load (ETL) ingestion workflow** for pooling-order mineral owner records.
 
-It ingests pooling-order rows from a shared Google Sheet, cleans and standardizes them, matches each record against the company's Pipedrive deals and BUDB (Bottoms Up Database) mineral-ownership records, and persists the result into a versioned, daily SQLite database for long-term retention and reporting.
+It ingests pooling-order rows from either of two independent, mutually exclusive sources — a shared Google Sheet, or local CSV/XLSX skip-trace export files — cleans and standardizes them, matches each record against the company's Pipedrive deals and BUDB (Bottoms Up Database) mineral-ownership records, and persists the result into a versioned, daily SQLite database for long-term retention and reporting.
 
 ---
 
-![Version](https://img.shields.io/badge/version-2.0.0-ffab4c?style=for-the-badge&logo=python&logoColor=white)
+![Version](https://img.shields.io/badge/version-2.1.0-ffab4c?style=for-the-badge&logo=python&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.11%2B-273946?style=for-the-badge&logo=python&logoColor=ffab4c)
 ![Status](https://img.shields.io/badge/status-active-273946?style=for-the-badge&logo=github&logoColor=ffab4c)
 
@@ -21,23 +21,28 @@ Manually cross-referencing each incoming owner against Pipedrive and BUDB to che
 
 To close this gap, a repeatable ingestion pipeline is required — one that standardizes incoming data, automatically links it to existing Pipedrive deals and BUDB records, and stores the result in a daily, auditable database.
 
+A second, independent need is onboarding locally received skip-trace export files (`.csv`/`.xlsx`) into the same database — without letting them delete or overwrite anything sourced from the Sheet, and without a round-trip writeback, since these files aren't the Sheet.
+
 PO DB Builder addresses this by enforcing a controlled ETL pipeline:
-1. Extract pooling-order records from the shared Google Sheet's `po_db` tab.
+1. Extract pooling-order records from the shared Google Sheet's `po_db` tab, **or** from locally selected CSV/XLSX skip-trace files (one source per build, chosen via a radio button).
 2. Clean and standardize columns, phone numbers, and dates, flagging any suspicious data loss for audit.
 3. Match each record to a Pipedrive deal ID and a BUDB ID using cached reference data.
-4. Sync the result into a daily-versioned SQLite database, tracking inserts/updates/deletes.
-5. Write matched IDs, serial numbers, and upload dates back to the Google Sheet and generate audit/report files for review.
+4. Sync the result into a daily-versioned SQLite database, tracking inserts/updates/deletes (Google Sheet source) or appending new rows only (local-file source).
+5. For a Google Sheet build, write matched IDs, serial numbers, and upload dates back to the Sheet; local-file builds have no writeback. Both generate audit/report files for review.
 
 ---
 
 ## ✨ Features
-- **Google Sheets ingestion**: reads live data from a shared Google Sheet (tab must be named `po_db`) via a Google service account, with hyperlink extraction (rich-text/chip/link metadata) and a header-capture mode that guards against a link's display text leaking in as a column header; each download is re-read twice (and the Sheet's `modifiedTime` re-checked) to confirm nothing changed mid-capture, and is backed up locally under `input/google_sheet_backups/` (one subfolder per spreadsheet ID, as a timestamped `.xlsx` snapshot plus a JSON snapshot of the raw cell data) for traceability.
+- **Two independent, mutually exclusive import sources**, picked per build with a radio button on the **Import** tab — selecting one clears and disables the other's inputs, so a build can never mix sources:
+  - **Google Sheets ingestion**: reads live data from a shared Google Sheet (tab must be named `po_db`) via a Google service account, with hyperlink extraction (rich-text/chip/link metadata) and a header-capture mode that guards against a link's display text leaking in as a column header; each download is re-read twice (and the Sheet's `modifiedTime` re-checked) to confirm nothing changed mid-capture, and is backed up locally under `input/google_sheet_backups/` (one subfolder per spreadsheet ID, as a timestamped `.xlsx` snapshot plus a JSON snapshot of the raw cell data) for traceability. The Sheet is treated as the single source of truth: rows are inserted, updated, or **deleted** to match it, and matched IDs/serial numbers/upload dates are written back to it.
+  - **Local CSV/XLSX ingestion** (`po_local_source.py`): reads locally selected skip-trace export files instead — either multiple files picked directly, or a folder (recursed for `.csv`/`.xlsx`/`.xls`), combined into one build. See **Local file import** below for full details — it is purely additive (no updates/deletes, no Google writeback), with its own required-column, duplicate, and blank-value checks.
 - **Data cleaning**: column name sanitization, phone number and date normalization (including numeric Excel date serials), and a NULL-conversion audit for anything that looks like unintended data loss.
 - **Stable row identity**: incoming rows are matched back to existing database rows by `po_id` (format `porec_XXXXXX`); new rows are assigned the next sequential `po_id` and serial number (format `PO-XXXX`), with both sequences recovered from the database itself (or its action-log history) if the running counters aren't already cached.
 - **Pipedrive deal matching** against a Pipedrive deals cache, downloaded automatically via the Pipedrive API (PO ID, serial number, name + address, and deal-title + address matching, each tracked separately in a per-row audit of which method(s) matched), with a SQLite-backed lookup cache for speed.
 - **BUDB ID matching** against a BUDB reference database **you select each session** on the **Bottoms Up** tab (owner name + address matching across both the primary and secondary address fields), with its own signature-based lookup cache that rebuilds only when the selected file changes.
   - **BUDB contact-group auto-resolution**: if a matched owner's BUDB IDs span more than one distinct `contact_group_id`, the app automatically keeps only the IDs belonging to the lowest-numbered group and records the full decision (all groups seen, which IDs were kept/removed) in a `budb_group_selection` audit sheet for review.
 - **Combined-county enrichment**: derives a `combined_counties` value from each row's target county and state.
+- **Full-database derived-column refresh (local-file builds only)**: after appending new local-file rows, `deal_id`, `budb_id`, `contact_group_id`, and `combined_counties` are recomputed for **every** row currently in `pooling_order` (not just the new ones) and only genuinely changed values are written back — since new local rows can shift which BUDB contact group is "lowest" for owners that already existed in the table.
 - **Pre-flight "Check references"**: validates Google Sheet access/permissions and content (headers, data rows), the Pipedrive API token, the BUDB file, and local storage (required folders, a single active database, and that it's readable), before enabling the build button, so a bad credential or file issue is caught before any database changes are made.
 - **Tracked, crash-safe database builds** (`po_build_state.py`):
   - Auto-creates/copies forward a new dated DB each day from the most recent prior one (same-day re-runs continue syncing into that day's file).
@@ -76,6 +81,39 @@ PO DB Builder addresses this by enforcing a controlled ETL pipeline:
 8. Saves output artifacts:
    - `audit/` — a combined NULL-conversion + BUDB group-selection audit workbook (only if either kind of issue was found).
    - `existing_deals/` — deal-match audit and the PO-associated-deals report.
+
+### Local file import flow (`po_local_source.py`)
+
+Selected via the **Local Files** radio button on the **Import** tab instead of **Google Sheets**. Rows from local files are always treated as brand-new — there is no `po_id` matching, no update/delete of existing rows, and no Google writeback.
+
+1. **Required columns.** Each file's headers are matched case-insensitively against a set of accepted spellings per field, then renamed to their canonical name; anything left over (the `DEC:`/`ADD:`/`PH:`/`EMAIL:` skip-trace detail columns, etc.) is handled by the normal generic `sanitize_colname()`. A file missing any required column is rejected outright. The canonical fields and their accepted header spellings:
+   | Canonical column | Accepted header spelling(s) |
+   |---|---|
+   | `lessor_owner` | `Lessor`, `Owner` |
+   | `contact_type` | `Contact Type` |
+   | `target_county` | `Target County` |
+   | `target_state` | `Target State` |
+   | `first_name` | `Input: First Name`, `First Name` |
+   | `middle_name` | `Middle Name`, `Input: Middle Name` |
+   | `last_name` | `Input: Last Name`, `Last Name` |
+   | `address` | `Input: Address 1`, `Input: Address`, `Address` |
+   | `city` | `Input: City`, `City` |
+   | `state` | `Input: State`, `State` |
+   | `postal_code` | `Input: Zip Code`, `Postal Code`, `Zip Code`, `postal_code`, `zip_code` |
+   | `attn` | `ATTN` |
+2. **Check references** (per selected file, before any database change):
+   - Rejects a file with no data rows.
+   - Rejects a file with any blank/NULL value in `lessor_owner`, `target_county`, or `target_state` — the **entire file** is skipped (not just the offending rows), with a popup naming the file, the affected column(s), and the row number(s).
+   - If a file's name already matches an existing `source_url` in the database, prompts Yes/No to continue checking it anyway; if continued, the file is auto-skipped unless it still has at least one row that wouldn't be a duplicate.
+   - Files that pass become the build's file list; **Build DB** stays disabled until at least one file passes.
+3. **Build DB**, for the validated file list:
+   - Reads and concatenates all files, applying the same `clean_and_prepare_df()` column/phone/date cleaning used for the Google Sheet path.
+   - Backfills `decd_source = "IDI"` wherever `dec_deceased_y_n_u` is present and `decd_source` is otherwise null (local files have no `decd_source` column of their own).
+   - Drops duplicate rows — a row matching an existing `pooling_order` row, or an earlier row already queued in this same batch, on the full required-column set (including `target_county`/`target_state`) — and records why each dropped row was skipped, plus a per-file read/kept/skipped summary.
+   - Allocates fresh `po_id`/`serial_number` values via the same `allocate()` used by the Google path (still monotonic, never reused).
+   - Writes only into columns that **already exist** in `pooling_order` — no new columns are added from local data, with one named exception: `attn` is recognized and added to the schema if it isn't already there (see table above). Any other unrecognized column is dropped and logged.
+   - Appends the new rows (insert-only — never updates or deletes existing rows), sets `source_url` to the originating filename, then runs the full-database derived-column refresh described under **Features** above.
+   - Saves `audit/po_local_audit_<build_id>.xlsx` (null-conversion audit, skipped-row reasons, per-file summary, BUDB group-selection audit) whenever any of those have entries.
 
 ### Action-log flow (`pooling_order_action_log.py`)
 This runs **inside `app.py`** — the **Update Action Log** button becomes enabled once a build reaches `ready_for_log`, and clicking it diffs the build's recorded before/after snapshots automatically, with no manual file copying needed.
@@ -174,11 +212,13 @@ Additional cleaning behaviors:
 ## 📝 Requirements
 - **Python**: 3.11+ recommended.
 - **Services**:
-  - Google Cloud service account with Sheets (read/write) and Drive (read-only) scopes — required, since the Google Sheet is the only supported import source.
-- **Local reference data** (not included in the repo — must be supplied per environment):
+  - Google Cloud service account with Sheets (read/write) and Drive (read-only) scopes — required **only** if you'll use the Google Sheets import source. Not needed for local-file builds.
+- **Local reference data** (not included in the repo — must be supplied per environment; required regardless of which import source you use):
   - A BUDB SQLite database, selected on the **Bottoms Up** tab at the start of each session (any file location — there is no fixed folder or auto-detection). It must contain a `bottoms_up` table with at least one row and, at minimum, the columns: `id`, `contact_group_id`, `Owner`, `Owner (Standardized)`, `Input: Address`, `Input: City`, `Input: State`, `md_address`, `md_city`, `md_state`.
   - A Pipedrive deals source at `cache/pipedrive_local_cache.csv`. This is downloaded automatically via the Pipedrive API (see below); there's no supported way to keep it fresh with a manually re-exported file instead.
-  - A Google Sheet whose `po_db` tab includes, at minimum, the headers: `po_id`, `serial_number`, `date_uploaded`.
+- **Import source** (pick one per build):
+  - A Google Sheet whose `po_db` tab includes, at minimum, the headers: `po_id`, `serial_number`, `date_uploaded`. **Or:**
+  - One or more local `.csv`/`.xlsx`/`.xls` skip-trace export files (or a folder containing them) with the required columns listed under **Local file import flow** above.
 - **Python packages**: see `requirements.txt` (UI: `customtkinter`; data: `pandas`, `openpyxl`, `numpy`; Google auth: `google-auth`, `google-api-python-client`; HTTP: `requests`).
 
 > Install all pinned dependencies from `requirements.txt`.
@@ -202,6 +242,7 @@ Additional cleaning behaviors:
     ├── app.py                          Main application entry point (GUI)
     ├── po_transform.py                  Column cleaning, phone/date normalization
     ├── po_sqlite.py                     SQLite schema, po_id/serial allocation, row sync helpers
+    ├── po_local_source.py               Local CSV/XLSX ingestion: header mapping, required-column/blank/duplicate checks, insert-only build, full-table derived-column refresh
     ├── po_deal_id_matcher.py            Row-level Pipedrive deal ID matching (PO ID, serial, name+address, title+address)
     ├── pooling_order_pipedrive.py       Pipedrive cache loading + lookup maps
     ├── pipedrive_api.py                 Pipedrive API client + deals download/cache refresh
@@ -225,7 +266,7 @@ Additional cleaning behaviors:
     ├── audit/                          Combined NULL-conversion + BUDB group-selection audit exports (auto-created)
     ├── existing_deals/                 Deal-match audit + associated-deals reports (auto-created)
     ├── google_sheet_writeback/         Pending/completed Google writeback records (auto-created)
-    └── input/                          Local backup copies of each downloaded Google Sheet (auto-created)
+    └── input/                          Local backup copies of each downloaded Google Sheet (auto-created); also a convenient (not required) place to keep local-file-source skip-trace exports, selected via Browse
         └── google_sheet_backups/       One subfolder per spreadsheet ID, holding timestamped .xlsx + JSON snapshots
     </pre>
 
@@ -269,23 +310,35 @@ Additional cleaning behaviors:
 4. In the **Pipedrive** tab, confirm an API token is entered and saved (or, if the cache is still less than 8 hours old, confirm `cache/pipedrive_local_cache.csv` exists and is reasonably up to date).
 
 ### B. Import PO records
+
+Pick exactly one import source per build with the radio button at the top of the **Import** tab — selecting one clears and disables the other's fields.
+
+**B1. Google Sheets source**
 1. Launch the app (`python app.py`, or the compiled executable).
 2. On the **Pipedrive** tab, paste your API token and click **Save API token** (skip if already saved from a previous session).
 3. On the **Bottoms Up** tab, click **Browse** and select the current Bottoms Up `.db` file — this isn't remembered between launches, so it's needed every session.
-4. Paste the Google Sheet URL into the **Google Sheets URL** field (its `po_db` tab will be read).
+4. Select **Google Sheets** and paste the Sheet URL into the **Google Sheets URL** field (its `po_db` tab will be read).
 5. Click **Check references** — confirms the sheet is reachable, editable, and correctly formatted, the Pipedrive API token is valid, the BUDB file is valid, and local storage is ready. This must succeed before **Build DB** is enabled.
 6. Click **Build DB**.
 7. Watch the **Activity Log** for progress: cleaning, Pipedrive matching, BUDB matching, county enrichment, row sync, and Google writeback.
 8. On completion, a dialog confirms the build and the action log has already been updated as part of the same run — if the action log step itself fails, keep the updated database and click **Update Action Log** to retry.
 
+**B2. Local Files source**
+1. Launch the app, and complete steps 2–3 above (Pipedrive token, BUDB file) — both are still required; there is no Google service account needed for this source.
+2. Select **Local Files**, then click **Browse files...** to pick one or more `.csv`/`.xlsx`/`.xls` files directly, or **Browse folder...** to recurse a folder for qualifying files.
+3. Click **Check references**. Each selected file is validated independently: a file missing a required column, or with a blank `Lessor/Owner`/`Target County`/`Target State` anywhere in it, is rejected with a popup explaining why and excluded from the build; a file whose name already matches a `source_url` already in the database prompts Yes/No before checking it further. **Build DB** stays disabled until at least one file passes.
+4. Click **Build DB**. Rows from every accepted file are combined into a single build: cleaned/standardized, checked for duplicates against the database and each other, assigned fresh `po_id`/`serial_number` values, and inserted (existing rows are never updated or deleted by this path, and there is no Google writeback).
+5. Watch the **Activity Log** for progress, including the duplicate-row summary per file and the full-database derived-column refresh (`deal_id`/`budb_id`/`contact_group_id`/`combined_counties`) that runs afterward.
+6. On completion, review `audit/po_local_audit_<build_id>.xlsx` if the log mentions null conversions, skipped rows, or multi-group BUDB matches, then click **Update Action Log** same as the Google Sheets path.
+
 ### C. Review outputs
 - **The final output is the daily database itself**: `database/YYYY-MM-DD-pooling_order.db` — this is what the whole build updates.
-- Check `audit/` for the combined NULL-conversion / BUDB group-selection audit workbook if the log reported suspicious conversions or multi-group BUDB matches.
+- Check `audit/` for the combined NULL-conversion / BUDB group-selection audit workbook (Google Sheets builds) or `po_local_audit_<build_id>.xlsx` (local-file builds, also covering skipped/duplicate rows and the per-file summary) if the log reported anything worth reviewing.
 - Check `existing_deals/` for the deal-match audit and the PO-associated-deals report generated after every import.
-- Check the Activity Log for the Google Sheets writeback confirmation and record path under `google_sheet_writeback/`.
+- For a Google Sheets build, check the Activity Log for the writeback confirmation and record path under `google_sheet_writeback/` — local-file builds have no writeback step.
 
 ### D. Review the change log (`pooling_order_action_log.py`)
-After a build completes (step B.8 above), review the logged entries in the `pooling_order_action_log` table of the database in `database/` — check that the added/deleted/modified rows make sense for that version.
+After a build completes (**B1** step 8 or **B2** step 6 above), review the logged entries in the `pooling_order_action_log` table of the database in `database/` — check that the added/deleted/modified rows make sense for that version.
 - **If everything looks correct**: nothing further to do — that build is `complete` and is the official daily version.
 - **If something looks wrong**: coordinate on the flagged log entries to correct the input (Google Sheet) data, then:
   1. Restore the pre-build snapshot from `database/previous_versions/` back into `database/`.
@@ -339,6 +392,13 @@ python po_writeback.py --apply
 - **"Unexpected range-ID column header(s): ..."**: A column header pulled through as an internal Google Sheets range name instead of real text — rename that column's header in row 1.
 - **"An unresolved Google writeback exists" / "A previous Google writeback needs recovery."**: Resolve the pending file in `google_sheet_writeback/` before starting another Google Sheets import, or run `po_writeback.py --apply` (see **G** above).
 - **"Sheet values changed during capture." / "The sheet changed during checking."**: Re-run the import or check after editing of the sheet has stopped.
+- **"Browse a file or folder before checking references."**: With **Local Files** selected, click **Browse files...** or **Browse folder...** before clicking **Check references**.
+- **"No .csv/.xlsx files found in the selected input."**: The selected file(s)/folder contain no `.csv`/`.xlsx`/`.xls` files (temporary `~$...` lock files are ignored automatically).
+- **"missing required column(s): ..."**: A local file is missing one of the required columns — see **Local file import flow** above for the accepted header spellings per field (matching is case-insensitive).
+- **"Blank required values" popup / `[LOCAL] Skipped: <file> (blank ...)`**: The named file has a blank `Lessor/Owner`, `Target County`, or `Target State` value in the listed row(s). The whole file is skipped — fix the blanks and re-select it.
+- **"'<file>' already appears in the database (matched by filename)." (Yes/No prompt)**: A file with that exact name was already imported before. Choosing **No** skips it; choosing **Yes** re-checks its rows and auto-skips it anyway if every row turns out to already exist.
+- **"No files remain after duplicate checks: ..."**: Every selected file was skipped (blank required values, already-imported with no new rows, or no data rows) — review the Activity Log entries just above this error for the reason per file.
+- **"No importable rows: every row was a duplicate of an existing pooling_order row or another selected file."**: All rows across the accepted files turned out to be duplicates once checked again at build time (e.g. the database changed between Check references and Build DB) — re-run Check references.
 - **"Expected one initialized PO baseline." / "Found N .db files in database/."**: Only one active PO database is allowed directly inside `database/` — resolve the extra files (or run `initialize_po_baseline.py` if none exists yet).
 - **"The previous build is not finished."**: A prior build is stuck at `building`, `ready_for_log`, or `recovery_required`. Finish it (click **Update Action Log**) or resolve its recovery state before clicking **Build DB** again.
 - **"Recovery required" / "Build tracking disagrees; recovery required." / "Recorded build database is missing; recovery required."**: `config/build_state.json` and the database's own tracking no longer agree (e.g. a `.db` file was moved or replaced by hand). Inspect `database/`, `config/build_state.json`, and the relevant `previous_versions/` snapshot before deleting anything.
