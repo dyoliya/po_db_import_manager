@@ -27,7 +27,7 @@ import uuid
 from tkinter import filedialog
 
 from po_transform import clean_and_prepare_df, sanitize_colname
-from po_sqlite import SYSTEM, DERIVED, PROTECTED, allocate, synchronize, append_new_rows, combined_counties, validate_po_baseline
+from po_sqlite import SYSTEM, DERIVED, PROTECTED, allocate, synchronize, append_new_rows, combined_counties, validate_po_baseline, quote
 from po_deal_id_matcher import populate_po_deal_ids_in_df
 from pooling_order_budb import (
     load_budb_lookup_maps,
@@ -700,7 +700,7 @@ class POImporterApp(ctk.CTk):
         self.ACCENT_HOVER = "#ffab4c"
         self.TEXT_DARK = "#273946"
 
-        self.title("PO DB Builder [v2.1.0]")
+        self.title("PO DB Builder [v2.2.0]")
         default_width, default_height = 760, 610
         width = min(default_width, self.winfo_screenwidth() - 40)
         height = min(default_height, self.winfo_screenheight() - 80)
@@ -2505,6 +2505,20 @@ class POImporterApp(ctk.CTk):
 
             conn = sqlite3.connect(db_path)
             conn.execute("BEGIN IMMEDIATE")
+
+            # REQUIRED_COLUMNS (used below by drop_duplicate_rows) can include
+            # columns in ALLOWED_NEW_COLUMNS that don't exist in this baseline
+            # yet (e.g. "attn"). Add them to the schema now, before anything
+            # queries pooling_order for those columns.
+            existing_schema_columns = {r[1] for r in conn.execute("PRAGMA table_info(pooling_order)")}
+            new_schema_columns = sorted(ALLOWED_NEW_COLUMNS & set(df.columns) - existing_schema_columns)
+            for col in new_schema_columns:
+                conn.execute(f"ALTER TABLE pooling_order ADD COLUMN {quote(col)} TEXT")
+            if new_schema_columns:
+                self._log(
+                    "[LOCAL] Adding recognized new column(s) to pooling_order: "
+                    f"{', '.join(new_schema_columns)}"
+                )
 
             self.progress_callback(0, "[LOCAL] Checking for duplicate rows...")
             keep_mask, skipped_df = drop_duplicate_rows(conn, df, tracking_all)

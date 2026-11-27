@@ -101,6 +101,19 @@ Selected via the **Local Files** radio button on the **Import** tab instead of *
    | `state` | `Input: State`, `State` |
    | `postal_code` | `Input: Zip Code`, `Postal Code`, `Zip Code`, `postal_code`, `zip_code` |
    | `attn` | `ATTN` |
+
+   **Optional columns.** These are alternate spellings for columns that already exist in `pooling_order` but are NOT required — a file missing any of these is still accepted (they just won't be populated for that file):
+   | Existing column | Accepted alternate spelling(s) |
+   |---|---|
+   | `add_address_y_n_u` | `md_address_ynu` |
+   | `add_address1` / `_city` / `_state` / `_zip` / `_county` / `_first_seen` / `_last_seen` | `md_address` / `md_city` / `md_state` / `md_postalcode` / `md_county` / `md_first_seen` / `md_last_seen` |
+   | `ph_phone_y_n_u` | `phone_ynu` |
+   | `ph_phone1`–`ph_phone5` (+ `_type` / `_first_seen` / `_last_seen`) | `phone1`–`phone5` (+ `_type` / `_first_seen` / `_last_seen`) |
+   | `email_hit_y_n_u` | `email_hit_ynu` |
+   | `email_email1`–`email_email5` (+ `_first_seen` / `_last_seen`) | `email1`–`email5` (+ `_first_seen` / `_last_seen`) |
+   | `dec_deceased_y_n_u` | `deceased_ynu` |
+
+   A skip-trace export's `phone6`/`email6` (and `skip_traced`/`st_id`/`skip_traced_date`/`skip_traced_source`) columns have no equivalent slot in `pooling_order` and are still dropped/ignored, same as any other unrecognized column.
 2. **Check references** (per selected file, before any database change):
    - Rejects a file with no data rows.
    - Rejects a file with any blank/NULL value in `lessor_owner`, `target_county`, or `target_state` — the **entire file** is skipped (not just the offending rows), with a popup naming the file, the affected column(s), and the row number(s).

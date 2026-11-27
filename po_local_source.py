@@ -32,6 +32,65 @@ FIELD_HEADER_CANDIDATES = {
 }
 
 REQUIRED_COLUMNS = tuple(FIELD_HEADER_CANDIDATES)
+
+# Alternate header spellings for columns that already exist in pooling_order
+# but are NOT required — a file missing any of these is still accepted. Unlike
+# FIELD_HEADER_CANDIDATES, these never add a file to REQUIRED_COLUMNS; they
+# only widen which header text a given existing column is recognized under.
+OPTIONAL_FIELD_HEADER_CANDIDATES = {
+    "add_address_y_n_u": {"md_address_ynu"},
+    "add_address1": {"md_address"},
+    "add_address1_city": {"md_city"},
+    "add_address1_state": {"md_state"},
+    "add_address1_zip": {"md_postalcode"},
+    "add_address1_county": {"md_county"},
+    "add_address1_first_seen": {"md_first_seen"},
+    "add_address1_last_seen": {"md_last_seen"},
+    "ph_phone_y_n_u": {"phone_ynu"},
+    "ph_phone1": {"phone1"},
+    "ph_phone1_first_seen": {"phone1_first_seen"},
+    "ph_phone1_last_seen": {"phone1_last_seen"},
+    "ph_phone1_type": {"phone1_type"},
+    "ph_phone2": {"phone2"},
+    "ph_phone2_first_seen": {"phone2_first_seen"},
+    "ph_phone2_last_seen": {"phone2_last_seen"},
+    "ph_phone2_type": {"phone2_type"},
+    "ph_phone3": {"phone3"},
+    "ph_phone3_first_seen": {"phone3_first_seen"},
+    "ph_phone3_last_seen": {"phone3_last_seen"},
+    "ph_phone3_type": {"phone3_type"},
+    "ph_phone4": {"phone4"},
+    "ph_phone4_first_seen": {"phone4_first_seen"},
+    "ph_phone4_last_seen": {"phone4_last_seen"},
+    "ph_phone4_type": {"phone4_type"},
+    "ph_phone5": {"phone5"},
+    "ph_phone5_first_seen": {"phone5_first_seen"},
+    "ph_phone5_last_seen": {"phone5_last_seen"},
+    "ph_phone5_type": {"phone5_type"},
+    "email_hit_y_n_u": {"email_hit_ynu"},
+    "email_email1": {"email1"},
+    "email_email1_first_seen": {"email1_first_seen"},
+    "email_email1_last_seen": {"email1_last_seen"},
+    "email_email2": {"email2"},
+    "email_email2_first_seen": {"email2_first_seen"},
+    "email_email2_last_seen": {"email2_last_seen"},
+    "email_email3": {"email3"},
+    "email_email3_first_seen": {"email3_first_seen"},
+    "email_email3_last_seen": {"email3_last_seen"},
+    "email_email4": {"email4"},
+    "email_email4_first_seen": {"email4_first_seen"},
+    "email_email4_last_seen": {"email4_last_seen"},
+    "email_email5": {"email5"},
+    "email_email5_first_seen": {"email5_first_seen"},
+    "email_email5_last_seen": {"email5_last_seen"},
+    "dec_deceased_y_n_u": {"deceased_ynu"},
+}
+
+# Headers matched against during renaming: required fields first, then
+# optional ones. Keeping them separate dicts means REQUIRED_COLUMNS (derived
+# from FIELD_HEADER_CANDIDATES only) is unaffected by the optional additions.
+ALL_FIELD_HEADER_CANDIDATES = {**FIELD_HEADER_CANDIDATES, **OPTIONAL_FIELD_HEADER_CANDIDATES}
+
 DERIVED_COLUMNS = ("deal_id", "budb_id", "contact_group_id", "combined_counties")
 
 # Columns that must never be blank/NULL in a local file — a file with any
@@ -107,7 +166,7 @@ def _rename_known_headers(df: pd.DataFrame):
 
     for column in df.columns:
         normalized = _normalize_header(column)
-        for field, candidates in FIELD_HEADER_CANDIDATES.items():
+        for field, candidates in ALL_FIELD_HEADER_CANDIDATES.items():
             if field in matched_fields or field in rename_map.values():
                 continue
             if normalized in candidates:
